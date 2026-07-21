@@ -31,6 +31,7 @@
 #pragma once
 
 #include "log.h"
+#include "matmul.h"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -401,7 +402,7 @@ static inline ggml_tensor* llama_self_attn(ggml_context* ctx, ggml_tensor* x, gg
         // Single fused matmul: one mul_mat instead of three.
         // qkv_w: [d_model, q_dim + k_dim + v_dim]
         // Output: [q_dim + k_dim + v_dim, T]
-        ggml_tensor* qkv = ggml_mul_mat(ctx, qkv_w, x);
+        ggml_tensor* qkv = core_ggml::mul_mat(ctx, qkv_w, x);
         const int q_dim = n_q * hd;
         const int kv_dim = n_kv * hd;
         const int T = (int)x->ne[1];
@@ -411,9 +412,9 @@ static inline ggml_tensor* llama_self_attn(ggml_context* ctx, ggml_tensor* x, gg
         V = ggml_view_2d(ctx, qkv, kv_dim, T, qkv->nb[1], (q_dim + kv_dim) * ggml_type_size(qkv->type));
     } else {
         // Standard 3 separate matmuls (backward compat).
-        Q = ggml_mul_mat(ctx, q_w, x);
-        K = ggml_mul_mat(ctx, k_w, x);
-        V = ggml_mul_mat(ctx, v_w, x);
+        Q = core_ggml::mul_mat(ctx, q_w, x);
+        K = core_ggml::mul_mat(ctx, k_w, x);
+        V = core_ggml::mul_mat(ctx, v_w, x);
     }
 
     // T is the time dim of x; ggml stores [d_model, T] as ne = [d_model, T].
@@ -455,7 +456,7 @@ static inline ggml_tensor* llama_self_attn(ggml_context* ctx, ggml_tensor* x, gg
     attn = ggml_reshape_2d(ctx, attn, hd * n_q, T);
 
     // Output projection (no bias).
-    return ggml_mul_mat(ctx, o_w, attn);
+    return core_ggml::mul_mat(ctx, o_w, attn);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,13 +500,13 @@ static inline ggml_tensor* encoder_self_attn(ggml_context* ctx, ggml_tensor* x, 
     const int T = (int)x->ne[1];
 
     // Q/K/V projections with optional biases.
-    ggml_tensor* Q = ggml_mul_mat(ctx, q_w, x);
+    ggml_tensor* Q = core_ggml::mul_mat(ctx, q_w, x);
     if (q_b)
         Q = ggml_add(ctx, Q, q_b);
-    ggml_tensor* K = ggml_mul_mat(ctx, k_w, x);
+    ggml_tensor* K = core_ggml::mul_mat(ctx, k_w, x);
     if (k_b)
         K = ggml_add(ctx, K, k_b);
-    ggml_tensor* V = ggml_mul_mat(ctx, v_w, x);
+    ggml_tensor* V = core_ggml::mul_mat(ctx, v_w, x);
     if (v_b)
         V = ggml_add(ctx, V, v_b);
 
@@ -546,7 +547,7 @@ static inline ggml_tensor* encoder_self_attn(ggml_context* ctx, ggml_tensor* x, 
     attn = ggml_reshape_2d(ctx, attn, hd * n_q, T);
 
     // Output projection with optional bias.
-    attn = ggml_mul_mat(ctx, o_w, attn);
+    attn = core_ggml::mul_mat(ctx, o_w, attn);
     if (o_b)
         attn = ggml_add(ctx, attn, o_b);
     return attn;
@@ -692,7 +693,7 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
         // the downstream ggml_reshape_3d would fail its contiguity assert.
         // ggml_cont materialises each into its own contiguous buffer; for
         // T=1 the cont is a no-op (single row is already contiguous).
-        ggml_tensor* qkv = ggml_mul_mat(ctx0, qkv_w, x);
+        ggml_tensor* qkv = core_ggml::mul_mat(ctx0, qkv_w, x);
         if (qkv_b) {
             // Fused bias (1D, length q_dim + 2*kv_dim) added before the
             // split so each Q/K/V chunk picks up its own slice. One add
@@ -711,9 +712,9 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
             V = ggml_cont(ctx0, V);
         }
     } else {
-        Q = ggml_mul_mat(ctx0, q_w, x);
-        K = ggml_mul_mat(ctx0, k_w, x);
-        V = ggml_mul_mat(ctx0, v_w, x);
+        Q = core_ggml::mul_mat(ctx0, q_w, x);
+        K = core_ggml::mul_mat(ctx0, k_w, x);
+        V = core_ggml::mul_mat(ctx0, v_w, x);
     }
 
     // Optional Q/K/V projection biases (Qwen2). Applied before reshape so
@@ -919,7 +920,7 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
         ggml_build_forward_expand(gf, attn);
     }
 
-    ggml_tensor* out = ggml_mul_mat(ctx0, o_w, attn);
+    ggml_tensor* out = core_ggml::mul_mat(ctx0, o_w, attn);
     if (o_b)
         out = ggml_add(ctx0, out, o_b);
     return out;

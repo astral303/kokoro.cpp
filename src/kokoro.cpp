@@ -38,6 +38,7 @@
 #include "core/lstm.h"
 #include "core/kokoro_env.h"
 #include "core/log.h"
+#include "core/matmul.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -428,7 +429,7 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     x = ggml_add(ctx0, x, eln_b);
 
     // embd_proj: Linear D_emb → D
-    x = ggml_mul_mat(ctx0, ep_w, x);
+    x = core_ggml::mul_mat(ctx0, ep_w, x);
     x = ggml_add(ctx0, x, ep_b); // (D, L)
 
     // ---- 12 shared ALBERT layers ----
@@ -469,10 +470,10 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
         x = ggml_add(ctx0, x, aln_b);
 
         // FFN: up → GELU(tanh approx, "gelu_new") → down (with biases).
-        ggml_tensor* ffn = ggml_mul_mat(ctx0, fu_w, x);
+        ggml_tensor* ffn = core_ggml::mul_mat(ctx0, fu_w, x);
         ffn = ggml_add(ctx0, ffn, fu_b);
         ffn = ggml_gelu(ctx0, ffn); // tanh-approx == ALBERT "gelu_new"
-        ffn = ggml_mul_mat(ctx0, fd_w, ffn);
+        ffn = core_ggml::mul_mat(ctx0, fd_w, ffn);
         ffn = ggml_add(ctx0, ffn, fd_b);
         x = ggml_add(ctx0, x, ffn);
         x = ggml_norm(ctx0, x, kBertLayerNormEps);
@@ -491,7 +492,7 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     // bert_proj: Linear 768 → 512, applied per-token.
     ggml_tensor* bp_w = require(c, "bert_proj.weight");
     ggml_tensor* bp_b = require(c, "bert_proj.bias");
-    ggml_tensor* proj = ggml_mul_mat(ctx0, bp_w, seq); // (512, L)
+    ggml_tensor* proj = core_ggml::mul_mat(ctx0, bp_w, seq); // (512, L)
     proj = ggml_add(ctx0, proj, bp_b);
     ggml_set_name(proj, "bert_proj_out");
     ggml_set_output(proj);
@@ -526,7 +527,7 @@ static inline ggml_tensor* kokoro_adaln(ggml_context* ctx, ggml_tensor* x, ggml_
                                         ggml_tensor* fc_b) {
     const int C = (int)x->ne[0];
     // h = fc(s) → (2C, 1)
-    ggml_tensor* h = ggml_mul_mat(ctx, fc_w, style);
+    ggml_tensor* h = core_ggml::mul_mat(ctx, fc_w, style);
     h = ggml_add(ctx, h, fc_b);
     // chunk along ne[0]: γ ∈ [0, C), β ∈ [C, 2C).
     const size_t ts = ggml_type_size(GGML_TYPE_F32);
@@ -633,7 +634,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
     ggml_tensor* b_hh_r = require(c, "text_enc.lstm.bias_hh_l0_reverse");
 
     ggml_tensor* lstm_out =
-        core_lstm::lstm_bidir(ctx0, gf, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
+        core_lstm::lstm_bidir(ctx0, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
                               H_lstm); // (2H = D, L)
 
     ggml_set_name(lstm_out, "text_enc_out");
@@ -728,7 +729,7 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
     }
 
     // gamma, beta from fc(s).
-    ggml_tensor* h = ggml_mul_mat(ctx, fc_w, style);
+    ggml_tensor* h = core_ggml::mul_mat(ctx, fc_w, style);
     h = ggml_add(ctx, h, fc_b);
     if (dbg_prefix) {
         char nm[128];
@@ -1010,7 +1011,7 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
         std::snprintf(buf, sizeof(buf), "pred.dur_enc.%d.lstm.bias_hh_l0_reverse", il);
         ggml_tensor* b_hh_r = require(c, buf);
 
-        x = core_lstm::lstm_bidir(ctx0, gf, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
+        x = core_lstm::lstm_bidir(ctx0, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
                                   H_lstm); // (512, L)
 
         std::snprintf(buf, sizeof(buf), "pred.dur_enc.%d.adaln.weight", il);
@@ -1038,7 +1039,7 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     ggml_tensor* pl_b_ih_r = require(c, "pred.lstm.bias_ih_l0_reverse");
     ggml_tensor* pl_b_hh_r = require(c, "pred.lstm.bias_hh_l0_reverse");
 
-    ggml_tensor* pl_out = core_lstm::lstm_bidir(ctx0, gf, dur_enc_out, pl_W_ih_f, pl_W_hh_f, pl_b_ih_f, pl_b_hh_f,
+    ggml_tensor* pl_out = core_lstm::lstm_bidir(ctx0, dur_enc_out, pl_W_ih_f, pl_W_hh_f, pl_b_ih_f, pl_b_hh_f,
                                                 pl_W_ih_r, pl_W_hh_r, pl_b_ih_r, pl_b_hh_r, H_lstm); // (512, L)
     ggml_set_name(pl_out, "pred_lstm_out");
     ggml_set_output(pl_out);
@@ -1046,7 +1047,7 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     // ---- pred.dur_proj: Linear(512 → 50) ----
     ggml_tensor* dp_w = require(c, "pred.dur_proj.weight"); // ne=(512, 50)
     ggml_tensor* dp_b = require(c, "pred.dur_proj.bias");   // ne=(50,)
-    ggml_tensor* dp = ggml_mul_mat(ctx0, dp_w, pl_out);     // (50, L)
+    ggml_tensor* dp = core_ggml::mul_mat(ctx0, dp_w, pl_out);     // (50, L)
     dp = ggml_add(ctx0, dp, dp_b);
     dp = ggml_sigmoid(ctx0, dp);
     // sum over the 50 dim (ne[0]) → (1, L). Runtime does the round+clamp.
@@ -1109,7 +1110,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     ggml_tensor* sh_b_ih_r = require(c, "pred.shared.bias_ih_l0_reverse");
     ggml_tensor* sh_b_hh_r = require(c, "pred.shared.bias_hh_l0_reverse");
 
-    ggml_tensor* shared_out = core_lstm::lstm_bidir(ctx0, gf, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f, sh_W_ih_r,
+    ggml_tensor* shared_out = core_lstm::lstm_bidir(ctx0, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f, sh_W_ih_r,
                                                     sh_W_hh_r, sh_b_ih_r, sh_b_hh_r,
                                                     H_lstm); // (512, T_frames)
     // Named output for diagnostics.

@@ -27,18 +27,18 @@
 // entirely (h_{-1} = 0), which matches PyTorch's default zero initial
 // state and avoids needing an externally-zeroed buffer.
 //
-// Output assembly: each step's h_t is written into a column of a
-// pre-allocated `output` tensor (shape (H, T)) via ggml_view_2d +
-// ggml_cpy + ggml_build_forward_expand.  This is the same pattern used
-// by core_attn::kv_self_attn for the persistent KV cache write — the
-// scheduler's view-tracking sequences the cpys before any downstream
-// read of the output.
+// Output assembly is functional: timestep columns are combined with a
+// balanced concat tree. Avoid side-effecting cpy-to-view writes here:
+// backend graph optimizers are free to transform the consumer of the
+// destination tensor without preserving those implicit write dependencies.
 
 #pragma once
 
+#include "matmul.h"
 #include "ggml.h"
 
 #include <cstddef>
+#include <vector>
 
 namespace core_lstm {
 
@@ -56,24 +56,21 @@ namespace core_lstm {
 //   reverse      iterate t = T-1 .. 0 (use the *_reverse weights)
 //
 // Returns the LSTM output as a contiguous (H, T) F32 tensor.
-static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* X, ggml_tensor* W_ih,
-                                       ggml_tensor* W_hh, ggml_tensor* b_ih, ggml_tensor* b_hh, int H, bool reverse) {
+static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_tensor* X, ggml_tensor* W_ih, ggml_tensor* W_hh,
+                                       ggml_tensor* b_ih, ggml_tensor* b_hh, int H, bool reverse) {
     const int T = (int)X->ne[1];
     const int H4 = 4 * H;
 
     // Input projection over all T timesteps at once.
     // proj_x ne = (4H, T)
-    ggml_tensor* proj_x = ggml_mul_mat(ctx, W_ih, X);
+    ggml_tensor* proj_x = core_ggml::mul_mat(ctx, W_ih, X);
     proj_x = ggml_add(ctx, proj_x, b_ih);
-
-    // Pre-allocated output container (H, T) F32.
-    ggml_tensor* output = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, T);
 
     ggml_tensor* h = nullptr;
     ggml_tensor* c = nullptr;
+    std::vector<ggml_tensor*> columns((size_t)T);
 
     const size_t row_stride_4h = proj_x->nb[1];
-    const size_t row_stride_h = output->nb[1];
     const size_t f32_size = ggml_type_size(GGML_TYPE_F32);
 
     const int t0 = reverse ? T - 1 : 0;
@@ -87,7 +84,7 @@ static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_cgraph* gf, ggml_
         // pre = px + (W_hh @ h + b_hh) — at step 0 the W_hh@0 term vanishes.
         ggml_tensor* pre;
         if (h) {
-            ggml_tensor* ph = ggml_mul_mat(ctx, W_hh, h); // (4H, 1)
+            ggml_tensor* ph = core_ggml::mul_mat(ctx, W_hh, h); // (4H, 1)
             ph = ggml_add(ctx, ph, b_hh);
             pre = ggml_add(ctx, px, ph);
         } else {
@@ -116,23 +113,34 @@ static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_cgraph* gf, ggml_
         // h_t = sigmoid(o) * tanh(c_t)
         h = ggml_mul(ctx, sig_o, ggml_tanh(ctx, c));
 
-        // Write h_t into column t of output.
-        ggml_tensor* slot = ggml_view_2d(ctx, output, H, 1, row_stride_h, (size_t)t * row_stride_h);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, h, slot));
+        columns[(size_t)t] = h;
     }
-    return output;
+
+    // Balanced concatenation keeps graph depth logarithmic and avoids the
+    // quadratic copying of repeatedly appending one column.
+    while (columns.size() > 1) {
+        std::vector<ggml_tensor*> next;
+        next.reserve((columns.size() + 1) / 2);
+        for (size_t i = 0; i < columns.size(); i += 2) {
+            if (i + 1 < columns.size())
+                next.push_back(ggml_concat(ctx, columns[i], columns[i + 1], /*dim=*/1));
+            else
+                next.push_back(columns[i]);
+        }
+        columns = std::move(next);
+    }
+    return columns[0];
 }
 
 // Bidirectional LSTM. Runs two unidirectional passes (forward over the
 // natural order, backward over the reversed order using the
 // *_reverse weights), then concatenates along the feature dim:
 //   output ne = (2H, T)  with forward H first, then backward H.
-static inline ggml_tensor* lstm_bidir(ggml_context* ctx, ggml_cgraph* gf, ggml_tensor* X, ggml_tensor* W_ih_f,
-                                      ggml_tensor* W_hh_f, ggml_tensor* b_ih_f, ggml_tensor* b_hh_f,
-                                      ggml_tensor* W_ih_r, ggml_tensor* W_hh_r, ggml_tensor* b_ih_r,
-                                      ggml_tensor* b_hh_r, int H) {
-    ggml_tensor* fwd = lstm_unidir(ctx, gf, X, W_ih_f, W_hh_f, b_ih_f, b_hh_f, H, /*reverse=*/false);
-    ggml_tensor* bwd = lstm_unidir(ctx, gf, X, W_ih_r, W_hh_r, b_ih_r, b_hh_r, H, /*reverse=*/true);
+static inline ggml_tensor* lstm_bidir(ggml_context* ctx, ggml_tensor* X, ggml_tensor* W_ih_f, ggml_tensor* W_hh_f,
+                                      ggml_tensor* b_ih_f, ggml_tensor* b_hh_f, ggml_tensor* W_ih_r,
+                                      ggml_tensor* W_hh_r, ggml_tensor* b_ih_r, ggml_tensor* b_hh_r, int H) {
+    ggml_tensor* fwd = lstm_unidir(ctx, X, W_ih_f, W_hh_f, b_ih_f, b_hh_f, H, /*reverse=*/false);
+    ggml_tensor* bwd = lstm_unidir(ctx, X, W_ih_r, W_hh_r, b_ih_r, b_hh_r, H, /*reverse=*/true);
     // Concat along feature axis (ne[0] == H), result (2H, T).
     return ggml_concat(ctx, fwd, bwd, /*dim=*/0);
 }

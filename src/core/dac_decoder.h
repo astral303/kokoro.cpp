@@ -58,6 +58,8 @@
 
 #pragma once
 
+#include "matmul.h"
+
 #include "core/conv.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -272,7 +274,7 @@ static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
     const int Cout = (int)wf->ne[2];
     if (K == 1 && dil == 1) {
         // pointwise conv == matmul over channels; im2col of a 1×1 kernel is a pure copy.
-        ggml_tensor* y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, wf, Cin, Cout), x); // (Cout, T)
+        ggml_tensor* y = core_ggml::mul_mat(ctx, ggml_reshape_2d(ctx, wf, Cin, Cout), x); // (Cout, T)
         if (b)
             y = ggml_add(ctx, y, b);
         return y;
@@ -341,7 +343,7 @@ static inline ggml_tensor* build_decode_graph(ggml_context* ctx, const DacWeight
         // pw conv: weight is (1, codebook_dim, hidden)
         ggml_tensor* W2d =
             ggml_reshape_2d(ctx, q.out_proj_w, q.out_proj_w->ne[0] * q.out_proj_w->ne[1], q.out_proj_w->ne[2]);
-        z = ggml_mul_mat(ctx, W2d, z); // (hidden, T)
+        z = core_ggml::mul_mat(ctx, W2d, z); // (hidden, T)
         if (q.out_proj_b)
             z = ggml_add(ctx, z, q.out_proj_b);
         z_q = k == 0 ? z : ggml_add(ctx, z_q, z);

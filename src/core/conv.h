@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include "matmul.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -158,7 +160,7 @@ static inline ggml_tensor* convt1d_decomp(ggml_context* ctx, ggml_tensor* x, ggm
     const int OC = (int)w_perm->ne[1] / K;
 
     // mul_mat contracts IC → col: [K*OC, T_in]
-    ggml_tensor* col = ggml_mul_mat(ctx, w_perm, x);
+    ggml_tensor* col = core_ggml::mul_mat(ctx, w_perm, x);
 
     // Request the full signal and crop it explicitly. ggml forks have used
     // both asymmetric "left crop" and symmetric "padding" semantics for p0;
