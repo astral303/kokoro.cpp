@@ -44,38 +44,41 @@ host decision. The important properties are:
 ## Current pipeline
 
 The current implementation still uses stage boundaries that are convenient for
-CPU debugging, but duration/text alignment no longer expands on the host:
+CPU debugging, but duration/text alignment no longer expands on the host, and
+BERT now feeds the duration predictor inside one functional graph:
 
 ```text
-1.  BERT graph
-      download bert_proj
-2.  Duration predictor graph
+1.  BERT + duration predictor graph
+      padded token IDs / positions in
+      bert_proj_out stays device-resident into the predictor
       download duration encoding and duration values
-3.  CPU duration rounding
+2.  CPU duration rounding
       build int32 alignment indices of length T_frames
-4.  F0/noise graph
+3.  F0/noise graph
       upload compact dur_enc (640,L) + indices; device ggml_get_rows → en
       download F0 and noise curves
-5.  Text encoder graph
+4.  Text encoder graph
       download text encoding
-6.  Decoder graph
+5.  Decoder graph
       upload compact text_enc (512,L) + same indices; device gather → asr
       download decoder activation
-7.  CPU harmonic source generation
+6.  CPU harmonic source generation
       upload decoder activation and harmonics
-8.  Generator graph
+7.  Generator graph
       download magnitude and phase
-9.  CPU iSTFT
+8.  CPU iSTFT
       return PCM
 ```
 
 Host-side alignment used to materialise and upload `(640,T_frames)` and
 `(512,T_frames)` tensors. Those expansions are now device gathers, so the H2D
 payload for alignment is approximately `(640+512)·L` floats plus `2·T_frames`
-int32 indices instead of `(640+512)·T_frames` floats. The duration vector remains
-the legitimate host synchronisation point for dynamic `T_frames`. Scheduler
-resets between graphs still prevent keeping predictor/text-encoder allocations
-resident across stages.
+int32 indices instead of `(640+512)·T_frames` floats. Merging BERT with the
+duration predictor also removed the `bert_proj_out` D2H host vector, its H2D
+re-upload, one scheduler reset/allocation, and one graph submission. The
+duration vector remains the legitimate host synchronisation point for dynamic
+`T_frames`. Scheduler resets between later graphs still prevent keeping
+predictor/text-encoder allocations resident across stages.
 
 This structure was originally reasonable for CPU-only inference: a backend
 upload/download was generally a host-memory copy, and independent stages were
@@ -374,7 +377,8 @@ steady-state library benchmarks.
 
 With `KOKORO_BENCH=1`, the CLI installs a Kokoro log callback and reports
 synchronised pipeline-stage times. Five F16 runs of the baseline fixture on the
-RX 7900 XTX gave these representative medians:
+RX 7900 XTX gave these representative medians **before** merging BERT into the
+duration predictor:
 
 | Stage | Median |
 |---|---:|
@@ -410,6 +414,22 @@ reproduced the same correlations and relative RMS deltas (`0.953535` /
 `0.304508` and `0.690742` / `0.785317`). Quick-mode CPU PCM remained
 bit-identical to the prior cached golden.
 
+After merging BERT and the duration predictor into one functional graph (same
+hardware, seed, baseline text, graph optimiser still enabled), one-run F16/Q8_0
+validation again reproduced those exact correlations and relative RMS deltas.
+Six `KOKORO_BENCH=1` F16 runs measured:
+
+| Stage | Pre-merge median | Post-merge median |
+|---|---:|---:|
+| BERT + Predictor | 29.61 ms (7.21 + 22.40) | 27.11 ms (`bert_predictor`) |
+| Complete synthesis pipeline | 107.91 ms | 103.77 ms |
+
+The combined stage is about 2.5 ms faster than the sum of the previous separate
+stages, and the pipeline total drops by about 4.1 ms. Treat that as end-to-end
+stage-timer improvement from removing one host round-trip plus one scheduler
+reset/submission — not as a claim that BERT/predictor FLOPs themselves got
+faster.
+
 ### Phase B — stable intermediate-stage diagnostics
 
 Add a test-only observer or diagnostic executable that captures existing host
@@ -437,7 +457,9 @@ metric implementation as WAV comparison.
 
 ### Phase D — remove avoidable host round-trips
 
-- Keep BERT output device-resident into the predictor where shape permits.
+- Done: keep BERT output device-resident into the predictor where shape
+  permits (combined BERT + duration-predictor graph; only `dur_enc_out` and
+  `durations_pre` cross to the host before the dynamic-duration barrier).
 - Read only the small duration vector.
 - Done: build alignment index tensors on the host and execute alignment as
   device gathers for duration and text encodings (`ggml_get_rows`).

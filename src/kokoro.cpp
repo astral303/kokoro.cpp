@@ -387,10 +387,12 @@ bool sanity_check_weights(const kokoro_context* c) {
 
 static const float kBertLayerNormEps = 1e-12f;
 
-// Build the BERT graph for L tokens. The graph has two int32 inputs
-// ("ids" and "positions", both length L) and exposes two outputs by
-// name: "bert_pooler_out" (768, L) and "bert_proj_out" (512, L).
-static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
+// Append BERT ops into an existing graph/context. Inputs: int32 "ids" and
+// "positions" (length L). Names "bert_pooler_out" (768, L) and
+// "bert_proj_out" (512, L). Does not mark them as graph outputs — the
+// synthesis path keeps bert_proj_out as a device-resident functional edge
+// into the duration predictor.
+static ggml_tensor* kokoro_graph_append_bert(ggml_context* ctx0, kokoro_context* c, int L) {
     const auto& hp = c->hp;
     const int D_emb = (int)hp.plbert_embd_size; // 128
     const int D = (int)hp.plbert_hidden;        // 768
@@ -398,11 +400,6 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     const int n_lay = (int)hp.plbert_n_layers;  // 12 shared
     const int hd = D / n_h;                     // 64
     const float attn_scale = 1.0f / std::sqrt((float)hd);
-
-    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
-    ggml_context* ctx0 = ggml_init(ip);
-    // ~30 ops per layer × 12 + embd/proj/pooler = a few hundred. 1024 is plenty.
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 1024, false);
 
     ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, L);
     ggml_set_name(ids, "ids");
@@ -493,8 +490,6 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     ggml_tensor* seq = x; // (D, L)
     seq = ggml_cont(ctx0, seq);
     ggml_set_name(seq, "bert_pooler_out");
-    ggml_set_output(seq);
-    ggml_build_forward_expand(gf, seq);
 
     // bert_proj: Linear 768 → 512, applied per-token.
     ggml_tensor* bp_w = require(c, "bert_proj.weight");
@@ -502,12 +497,9 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     ggml_tensor* proj = core_ggml::mul_mat(ctx0, bp_w, seq); // (512, L)
     proj = ggml_add(ctx0, proj, bp_b);
     ggml_set_name(proj, "bert_proj_out");
-    ggml_set_output(proj);
-    ggml_build_forward_expand(gf, proj);
-
-    ggml_free(ctx0);
-    return gf;
+    return proj;
 }
+
 
 
 // ---------------------------------------------------------------------------
@@ -957,25 +949,14 @@ static ggml_tensor* kokoro_voice_style_dec_view(ggml_context* ctx, kokoro_contex
     return kokoro_voice_style_slice(ctx, c, L_raw, 0);
 }
 
-static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L_raw) {
+// Append ProsodyPredictor ops into an existing graph/context.
+// bert_proj is the functional (512, L) input from BERT's bert_proj_out.
+// Required outputs: "dur_enc_out" (640, L) and "durations_pre" (1, L).
+static void kokoro_graph_append_predictor(ggml_context* ctx0, ggml_cgraph* gf, kokoro_context* c, int L, int L_raw,
+                                          ggml_tensor* bert_proj) {
     const auto& hp = c->hp;
-    const int D = (int)hp.hidden_dim;   // 512
     const int Hsty = (int)hp.style_dim; // 128
-    const int H_lstm = D / 2;           // 256
-
-    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
-    ggml_context* ctx0 = ggml_init(ip);
-    // 4 bidir LSTMs at small L (≤ ~520) + ~10 cat/AdaLN ops.
-    // Per LSTM: 2 dirs × L × ~14 ops ≈ 14600 nodes at L=520. 4 LSTMs ≈ 60k.
-    // 65536 buffer is generous but well within the 262144 sched ceiling.
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
-
-    // ---- Inputs ----
-    // bert_dur is the per-token output of `bert_proj` (M3 stage `bert_proj_out`),
-    // re-supplied as a graph input. Layout (D, L_padded) F32.
-    ggml_tensor* bert_dur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, L);
-    ggml_set_name(bert_dur, "bert_dur");
-    ggml_set_input(bert_dur);
+    const int H_lstm = (int)hp.hidden_dim / 2; // 256
 
     // ---- Style: bake voice-pack slice into the graph ----
     // s_pred is F16 (the voice pack is loaded F32 — wait, voice.pack is F32
@@ -987,8 +968,8 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     ggml_tensor* s_template = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, Hsty, L);
     ggml_tensor* s_broad = ggml_repeat(ctx0, style_pred, s_template); // (128, L)
 
-    // Initial cat([bert_dur, s_broad], dim=0) → (D + Hsty, L) = (640, L)
-    ggml_tensor* x = ggml_concat(ctx0, bert_dur, s_broad, /*dim=*/0);
+    // Initial cat([bert_proj, s_broad], dim=0) → (D + Hsty, L) = (640, L)
+    ggml_tensor* x = ggml_concat(ctx0, bert_proj, s_broad, /*dim=*/0);
 
     // ---- 3× alternating bidir-LSTM + AdaLN + cat-with-style ----
     for (int il = 0; il < 3; il++) {
@@ -1054,6 +1035,22 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     ggml_set_name(dur_pre, "durations_pre");
     ggml_set_output(dur_pre);
     ggml_build_forward_expand(gf, dur_pre);
+}
+
+
+// Combined BERT + duration predictor. Inputs: padded token ids/positions.
+// bert_proj_out stays device-resident and feeds the predictor as a
+// functional edge (no D2H host vector / H2D re-upload). Required outputs:
+// dur_enc_out and durations_pre.
+static ggml_cgraph* kokoro_build_graph_bert_predictor(kokoro_context* c, int L, int L_raw) {
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
+    ggml_context* ctx0 = ggml_init(ip);
+    // Predictor dominates node count and approaches the old 65k budget at the
+    // model's maximum sequence length; leave room for the appended BERT ops.
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 131072, false);
+
+    ggml_tensor* bert_proj = kokoro_graph_append_bert(ctx0, c, L);
+    kokoro_graph_append_predictor(ctx0, gf, c, L, L_raw, bert_proj);
 
     ggml_free(ctx0);
     return gf;
@@ -2053,7 +2050,9 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     if (out_n) *out_n = 0;
     if (!c->vp_loaded || n_raw <= 0) return nullptr;
 
-    // --- Stage 1: BERT ---
+    // --- Stage 1: BERT + duration predictor (one functional graph) ---
+    // bert_proj_out stays device-resident and feeds the predictor directly,
+    // removing the prior D2H host vector, H2D upload, and extra sched reset.
     auto stage_start = kokoro_bench_clock::now();
     std::vector<int32_t> padded;
     padded.reserve((size_t)n_raw + 2);
@@ -2066,42 +2065,27 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
         return nullptr;
     }
 
-    ggml_cgraph* gf_bert = kokoro_build_graph_bert(c, L);
-    if (!gf_bert) return nullptr;
+    ggml_cgraph* gf_bp = kokoro_build_graph_bert_predictor(c, L, n_raw);
+    if (!gf_bp) return nullptr;
     ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf_bert)) return nullptr;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_bert, "ids"), padded.data(), 0, (size_t)L * sizeof(int32_t));
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_bp)) return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_bp, "ids"), padded.data(), 0, (size_t)L * sizeof(int32_t));
     std::vector<int32_t> positions(L);
     for (int i = 0; i < L; i++) positions[i] = i;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_bert, "positions"), positions.data(), 0, (size_t)L * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(c->sched, gf_bert) != GGML_STATUS_SUCCESS) return nullptr;
-
-    ggml_tensor* bp_t = ggml_graph_get_tensor(gf_bert, "bert_proj_out");
-    const size_t bp_n = (size_t)bp_t->ne[0] * (size_t)bp_t->ne[1];
-    std::vector<float> bert_proj(bp_n);
-    ggml_backend_tensor_get(bp_t, bert_proj.data(), 0, bp_n * sizeof(float));
-    kokoro_bench_elapsed("bert", stage_start);
-
-    // --- Stage 2: Predictor (produces dur_enc_out + durations) ---
-    stage_start = kokoro_bench_clock::now();
-    ggml_cgraph* gf_pred = kokoro_build_graph_predictor(c, L, n_raw);
-    if (!gf_pred) return nullptr;
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf_pred)) return nullptr;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_pred, "bert_dur"), bert_proj.data(), 0, bp_n * sizeof(float));
-    if (ggml_backend_sched_graph_compute(c->sched, gf_pred) != GGML_STATUS_SUCCESS) return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_bp, "positions"), positions.data(), 0, (size_t)L * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(c->sched, gf_bp) != GGML_STATUS_SUCCESS) return nullptr;
 
     // Extract dur_enc_out (640, L)
-    ggml_tensor* de_t = ggml_graph_get_tensor(gf_pred, "dur_enc_out");
+    ggml_tensor* de_t = ggml_graph_get_tensor(gf_bp, "dur_enc_out");
     const size_t de_n = (size_t)de_t->ne[0] * (size_t)de_t->ne[1];
     std::vector<float> dur_enc(de_n);
     ggml_backend_tensor_get(de_t, dur_enc.data(), 0, de_n * sizeof(float));
 
-    // Extract durations (1, L) → round + clamp
-    ggml_tensor* dp_t = ggml_graph_get_tensor(gf_pred, "durations_pre");
+    // Extract durations (1, L) → round + clamp after the combined stage timer.
+    ggml_tensor* dp_t = ggml_graph_get_tensor(gf_bp, "durations_pre");
     std::vector<float> dur_raw((size_t)L);
     ggml_backend_tensor_get(dp_t, dur_raw.data(), 0, (size_t)L * sizeof(float));
-    kokoro_bench_elapsed("predictor", stage_start);
+    kokoro_bench_elapsed("bert_predictor", stage_start);
 
     stage_start = kokoro_bench_clock::now();
     const float length_scale = c->params.length_scale > 0.0f ? c->params.length_scale : 1.0f;
@@ -2112,7 +2096,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
         dur_int[i] = (int)v;
     }
 
-    // --- Stage 3: host duration rounding → compact I32 alignment indices ---
+    // --- Stage 2: host duration rounding → compact I32 alignment indices ---
     // T_frames is data-dependent; only the small duration vector must sync.
     // Index length must equal T_frames for both later gathers.
     int T_frames = 0;
@@ -2120,7 +2104,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     if (!align_idx || T_frames <= 0) { std::free(align_idx); return nullptr; }
     kokoro_bench_elapsed("duration_indices", stage_start);
 
-    // --- Stage 4: F0/N prediction (gather dur_enc on device, then F0/N) ---
+    // --- Stage 3: F0/N prediction (gather dur_enc on device, then F0/N) ---
     stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_f0n = kokoro_build_graph_f0n(c, T_frames, L, n_raw);
     if (!gf_f0n) { std::free(align_idx); return nullptr; }
@@ -2142,7 +2126,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_backend_tensor_get(n_t, n_curve.data(), 0, fn_n * sizeof(float));
     kokoro_bench_elapsed("f0_noise", stage_start);
 
-    // --- Stage 5: TextEncoder ---
+    // --- Stage 4: TextEncoder ---
     stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_te = kokoro_build_graph_text_enc(c, L);
     if (!gf_te) { std::free(align_idx); return nullptr; }
@@ -2159,7 +2143,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_backend_tensor_get(te_t, text_enc.data(), 0, te_n * sizeof(float));
     kokoro_bench_elapsed("text_encoder", stage_start);
 
-    // --- Stage 6+7: Decoder body (gather text_enc on device with same indices) ---
+    // --- Stage 5: Decoder body (gather text_enc on device with same indices) ---
     stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_dec = kokoro_build_graph_decoder_body(c, T_frames, L, n_raw);
     if (!gf_dec) { std::free(align_idx); return nullptr; }
@@ -2178,7 +2162,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_backend_tensor_get(dec_out, dec_decode.data(), 0, dec_n * sizeof(float));
     kokoro_bench_elapsed("decoder", stage_start);
 
-    // --- Stage 8: HnNSF (CPU-side har generation) ---
+    // --- Stage 6: HnNSF (CPU-side har generation) ---
     stage_start = kokoro_bench_clock::now();
     const char* seed_env = kokoro_env::get("KOKORO_SEED");
     uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
@@ -2188,7 +2172,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     if (!har) return nullptr;
     kokoro_bench_elapsed("harmonic_source", stage_start);
 
-    // --- Stage 9: Generator (produces mag + phase in one graph) ---
+    // --- Stage 7: Generator (produces mag + phase in one graph) ---
     stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_gen = kokoro_build_graph_generator(c, T_frames, T_har, n_raw);
     if (!gf_gen) { std::free(har); return nullptr; }
@@ -2208,7 +2192,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_backend_tensor_get(phase_t, phase.data(), 0, mp_n * sizeof(float));
     kokoro_bench_elapsed("generator", stage_start);
 
-    // --- Stage 10: iSTFT (CPU) ---
+    // --- Stage 8: iSTFT (CPU) ---
     int T_audio = 0;
     float* audio = kokoro_run_istft(mag.data(), phase.data(), T_har, &T_audio);
     if (!audio) return nullptr;
