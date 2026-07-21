@@ -21,7 +21,6 @@ ggml (submodule)
 ----------------
 
   Source: https://github.com/CrispStrobe/ggml (fork of ggml-org/ggml)
-  Pin:    bfe8ea228d8134d03641c9fcf233a9931f3730de
   License: MIT
 
   The ggml tensor library provides the compute backend for all neural
