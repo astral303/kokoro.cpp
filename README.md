@@ -86,8 +86,10 @@ void my_log(enum kokoro_log_level level, const char *msg, void *ud) {
 kokoro_log_set(my_log, NULL);
 ```
 
-Logging is disabled by default. Library and GGML diagnostics are delivered only
-through the callback; the library never writes directly to stdout or stderr.
+kokoro.cpp logging is disabled by default and the library never writes directly
+to stdout or stderr. `kokoro_log_set()` controls only kokoro.cpp diagnostics.
+It deliberately leaves GGML's process-global logger untouched; applications
+embedding a shared GGML library must configure GGML logging themselves.
 
 ## API Design Notes
 

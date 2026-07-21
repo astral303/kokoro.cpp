@@ -91,8 +91,9 @@ enum kokoro_log_level {
 // Callback signature. msg has no trailing newline. Must be reentrant.
 typedef void (*kokoro_log_cb)(enum kokoro_log_level level, const char * msg, void * user_data);
 
-// Install a process-wide log callback for kokoro.cpp and GGML diagnostics.
-// NULL disables library logging; the library never writes directly to stderr.
+// Install a process-wide callback for kokoro.cpp diagnostics. NULL disables
+// kokoro.cpp logging. This does not modify GGML's process-global logger;
+// embedders that share GGML must configure GGML logging themselves.
 // Thread-safe install; takes effect on subsequent log delivery. The caller
 // must keep cb and user_data valid while synthesis may still be running.
 KOKORO_API void kokoro_log_set(kokoro_log_cb cb, void * user_data);

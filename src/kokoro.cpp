@@ -80,7 +80,6 @@
 static std::mutex g_log_mutex;
 static kokoro_log_cb g_log_cb = nullptr;
 static void* g_log_ud = nullptr;
-static std::once_flag g_ggml_log_once;
 
 void kokoro_log_internal(enum kokoro_log_level level, const char* fmt, ...) {
     char buf[2048];
@@ -105,27 +104,6 @@ void kokoro_log_internal(enum kokoro_log_level level, const char* fmt, ...) {
 }
 
 #define kokoro_log kokoro_log_internal
-
-static void kokoro_ggml_log(enum ggml_log_level level, const char* text, void*) {
-    enum kokoro_log_level mapped = KOKORO_LOG_INFO;
-    switch (level) {
-    case GGML_LOG_LEVEL_DEBUG: mapped = KOKORO_LOG_DEBUG; break;
-    case GGML_LOG_LEVEL_WARN:  mapped = KOKORO_LOG_WARN;  break;
-    case GGML_LOG_LEVEL_ERROR: mapped = KOKORO_LOG_ERROR; break;
-    case GGML_LOG_LEVEL_NONE:
-    case GGML_LOG_LEVEL_INFO:
-    case GGML_LOG_LEVEL_CONT:  break;
-    }
-    kokoro_log_internal(mapped, "%s", text ? text : "");
-}
-
-static void kokoro_install_ggml_log_adapter(void) {
-    std::call_once(g_ggml_log_once, [] {
-        // GGML otherwise installs a stderr logger. Route its diagnostics
-        // through the same host-controlled callback as kokoro.cpp.
-        ggml_log_set(kokoro_ggml_log, nullptr);
-    });
-}
 
 // ===========================================================================
 // Thread-local error state
@@ -2239,7 +2217,6 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         kokoro_set_error("device must be >= 0");
         return nullptr;
     }
-    kokoro_install_ggml_log_adapter();
     // Match PyTorch's torch.round behaviour (banker's rounding) when the
     // runtime later applies `nearbyintf` to durations (R5 in the plan).
     // Setting this globally is benign — the only place we round is the
