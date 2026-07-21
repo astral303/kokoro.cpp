@@ -1466,8 +1466,64 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
 
 // Snake-α activation. Thin alias to core_act::snake_alpha — see that
 // header for the (1, C, 1) layout convention and Metal-typing notes.
+// Channel-first (C, T) path — kept for CPU bit-identity.
 static inline ggml_tensor* kokoro_snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
     return core_act::snake_alpha(ctx, x, alpha);
+}
+
+// Vulkan generator path keeps activations in contiguous time-first (T, C).
+// ggml_conv_1d / ggml_norm / Vulkan's fused Snake kernel are all naturally
+// (T, C); staying in that layout removes the CONT transpose tax around every
+// AdaIN and Conv1d. Gated to Vulkan only so CPU (and untested Metal/CUDA)
+// keep the historical channel-first graph.
+static inline bool kokoro_generator_time_first(const kokoro_context* c) {
+    return c->selected_backend == KOKORO_BACKEND_VULKAN;
+}
+
+// AdaIN1d on contiguous (T, C): ggml_norm already reduces along ne[0]=T.
+// gamma/beta are reshaped to (1, C) so they broadcast over time.
+static inline ggml_tensor* kokoro_adain1d_tf(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, ggml_tensor* fc_w,
+                                            ggml_tensor* fc_b) {
+    const int C = (int)x->ne[1];
+    ggml_tensor* normed = ggml_norm(ctx, x, kAdaIn1dEps); // (T, C)
+
+    ggml_tensor* h = core_ggml::mul_mat(ctx, fc_w, style);
+    h = ggml_add(ctx, h, fc_b);
+    const size_t ts = ggml_type_size(GGML_TYPE_F32);
+    ggml_tensor* gamma = ggml_reshape_2d(ctx, ggml_view_1d(ctx, h, C, (size_t)0 * C * ts), 1, C); // (1, C)
+    ggml_tensor* beta = ggml_reshape_2d(ctx, ggml_view_1d(ctx, h, C, (size_t)1 * C * ts), 1, C);  // (1, C)
+
+    ggml_tensor* x_gamma = ggml_mul(ctx, normed, gamma);
+    ggml_tensor* out = ggml_add(ctx, normed, x_gamma);
+    return ggml_add(ctx, out, beta);
+}
+
+// Prepared Snake-α broadcast operands for Vulkan fusion.
+// Fusion requires exact MUL→SIN→SQR→MUL→ADD with contiguous x=(T,C) and
+// F32 a/inv_a=(1,C). The reciprocal is built as small graph ops; callers must
+// expand inv_a into the graph *before* the Snake chain so the DIV does not
+// sit between SQR and the second MUL (which would break ggml_can_fuse).
+struct kokoro_snake_alpha_tf {
+    ggml_tensor* a = nullptr;     // (1, C) F32
+    ggml_tensor* inv_a = nullptr; // (1, C) F32 = 1/a
+};
+
+static inline kokoro_snake_alpha_tf kokoro_snake_alpha_prepare_tf(ggml_context* ctx, ggml_tensor* alpha) {
+    const int C = (int)ggml_nelements(alpha);
+    ggml_tensor* a = ggml_reshape_2d(ctx, alpha, 1, C);
+    a = ggml_cast(ctx, a, GGML_TYPE_F32);                                  // (1, C) F32
+    ggml_tensor* ones = ggml_scale_bias(ctx, a, /*s=*/0.0f, /*b=*/1.0f);  // 0·a + 1
+    ggml_tensor* inv_a = ggml_div(ctx, ones, a);
+    return {a, inv_a};
+}
+
+static inline ggml_tensor* kokoro_snake1d_tf(ggml_context* ctx, ggml_tensor* x, const kokoro_snake_alpha_tf& alpha) {
+    // y = x + sin²(a·x) · inv_a   — exact Vulkan snake_pattern chain.
+    ggml_tensor* ax = ggml_mul(ctx, x, alpha.a);
+    ggml_tensor* sin_ax = ggml_sin(ctx, ax);
+    ggml_tensor* sin_sq = ggml_sqr(ctx, sin_ax);
+    ggml_tensor* scaled = ggml_mul(ctx, sin_sq, alpha.inv_a);
+    return ggml_add(ctx, x, scaled);
 }
 
 // AdaINResBlock1 (NOTE the capital "B" — this is the Generator's class, not
@@ -1537,6 +1593,20 @@ static inline ggml_tensor* kokoro_conv1d_kd(ggml_context* ctx, ggml_tensor* in, 
     return ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T)
 }
 
+// Time-first Conv1d: in/out stay (T, C). No transpose CONT around the op.
+static inline ggml_tensor* kokoro_conv1d_kd_tf(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b, int K,
+                                               int d) {
+    const int Tin = (int)in->ne[0];
+    const int Cout = (int)w->ne[2];
+    const int p = d * (K - 1) / 2;
+    ggml_tensor* y = ggml_conv_1d(ctx, w, in, /*s*/ 1, p, d); // (T, Cout, 1)
+    if (b) {
+        ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
+        y = ggml_add(ctx, y, b3);
+    }
+    return ggml_reshape_2d(ctx, y, Tin, Cout); // (T, Cout)
+}
+
 static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
                                                     const kokoro_resblock1_w& w) {
     for (int j = 0; j < 3; j++) {
@@ -1546,6 +1616,23 @@ static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tens
         xt = kokoro_adain1d(ctx, xt, style, w.a2w[j], w.a2b[j]);
         xt = kokoro_snake1d(ctx, xt, w.alpha2[j]);
         xt = kokoro_conv1d_kd(ctx, xt, w.c2w[j], w.c2b[j], w.K, /*d=*/1);
+        x = ggml_add(ctx, xt, x);
+    }
+    return x;
+}
+
+// Time-first AdaINResBlock1. alpha1/alpha2 must already be prepared and their
+// inv_a tensors expanded into `gf` before this runs.
+static inline ggml_tensor* kokoro_resblock1_forward_tf(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
+                                                       const kokoro_resblock1_w& w, const kokoro_snake_alpha_tf alpha1[3],
+                                                       const kokoro_snake_alpha_tf alpha2[3]) {
+    for (int j = 0; j < 3; j++) {
+        ggml_tensor* xt = kokoro_adain1d_tf(ctx, x, style, w.a1w[j], w.a1b[j]);
+        xt = kokoro_snake1d_tf(ctx, xt, alpha1[j]);
+        xt = kokoro_conv1d_kd_tf(ctx, xt, w.c1w[j], w.c1b[j], w.K, w.dilations[j]);
+        xt = kokoro_adain1d_tf(ctx, xt, style, w.a2w[j], w.a2b[j]);
+        xt = kokoro_snake1d_tf(ctx, xt, alpha2[j]);
+        xt = kokoro_conv1d_kd_tf(ctx, xt, w.c2w[j], w.c2b[j], w.K, /*d=*/1);
         x = ggml_add(ctx, xt, x);
     }
     return x;
@@ -1582,6 +1669,30 @@ static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in
     return yT;
 }
 
+// Time-first ConvTranspose1d. Decomposed mul_mat+col2im is still channels-first
+// internally, so this pays one conversion at each of its two boundaries via
+// convt1d_decomp_tf — do not rewrite GGML here.
+static inline ggml_tensor* kokoro_convt1d_pad_tf(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* w_perm,
+                                                 ggml_tensor* b, int stride, int pad) {
+    if (w_perm) {
+        const int K = (int)w->ne[0];
+        return core_convt::convt1d_decomp_tf(ctx, in, w_perm, b, stride, K, pad, pad);
+    }
+    // Fallback without w_perm: ggml_conv_transpose_1d already wants (T, Cin).
+    const int Cout = (int)w->ne[1];
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, in, stride, 0, 1); // (T_unpad, Cout, 1, 1)
+    const int T_unpad = (int)y->ne[0];
+    const int T_out = T_unpad - 2 * pad;
+    y = ggml_reshape_2d(ctx, y, T_unpad, Cout);
+    if (pad > 0) {
+        y = ggml_view_2d(ctx, y, T_out, Cout, (size_t)T_unpad * sizeof(float), (size_t)pad * sizeof(float));
+        y = ggml_cont(ctx, y); // (T_out, Cout)
+    }
+    if (b)
+        y = ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, (int)b->ne[0]));
+    return y;
+}
+
 // Conv1d helper for noise_convs[i]. Different from kokoro_conv1d_kd in that K
 // and stride may be non-trivial (k=12,s=6 for noise_convs[0]; k=1,s=1 for
 // noise_convs[1]). Does PyTorch-style same-output handling via explicit
@@ -1598,6 +1709,19 @@ static inline ggml_tensor* kokoro_conv1d_ks(ggml_context* ctx, ggml_tensor* in, 
     const int Tout = (int)y->ne[0];
     y = ggml_reshape_2d(ctx, y, Tout, Cout);
     return ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T_out)
+}
+
+// Time-first noise/post Conv1d: in/out (T, C).
+static inline ggml_tensor* kokoro_conv1d_ks_tf(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b, int s,
+                                               int p) {
+    const int Cout = (int)w->ne[2];
+    ggml_tensor* y = ggml_conv_1d(ctx, w, in, s, p, /*d*/ 1); // (T_out, Cout, 1)
+    if (b) {
+        ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
+        y = ggml_add(ctx, y, b3);
+    }
+    const int Tout = (int)y->ne[0];
+    return ggml_reshape_2d(ctx, y, Tout, Cout); // (T_out, Cout)
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,6 +1983,33 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         }
     }
 
+    const bool time_first = kokoro_generator_time_first(c);
+
+    // Prepared Snake-α operands for the Vulkan (T, C) path. Expanded into `gf`
+    // before any Snake chain so reciprocal DIVs cannot break MUL→SIN→SQR→MUL→ADD.
+    kokoro_snake_alpha_tf noise_a1[2][3] = {};
+    kokoro_snake_alpha_tf noise_a2[2][3] = {};
+    kokoro_snake_alpha_tf res_a1[6][3] = {};
+    kokoro_snake_alpha_tf res_a2[6][3] = {};
+    if (time_first) {
+        // Host uploads remain channel-first (C, T); convert once at the boundary.
+        x = ggml_cont(ctx0, ggml_transpose(ctx0, x));     // (2*T_frames, 512)
+        har = ggml_cont(ctx0, ggml_transpose(ctx0, har)); // (T_har, 22)
+
+        auto prep_block = [&](const kokoro_resblock1_w& w, kokoro_snake_alpha_tf a1[3], kokoro_snake_alpha_tf a2[3]) {
+            for (int j = 0; j < 3; j++) {
+                a1[j] = kokoro_snake_alpha_prepare_tf(ctx0, w.alpha1[j]);
+                a2[j] = kokoro_snake_alpha_prepare_tf(ctx0, w.alpha2[j]);
+                ggml_build_forward_expand(gf, a1[j].inv_a);
+                ggml_build_forward_expand(gf, a2[j].inv_a);
+            }
+        };
+        prep_block(noise_res0, noise_a1[0], noise_a2[0]);
+        prep_block(noise_res1, noise_a1[1], noise_a2[1]);
+        for (int b = 0; b < 6; b++)
+            prep_block(resblocks[b], res_a1[b], res_a2[b]);
+    }
+
     // ---- Upsample loop ----
     for (int i = 0; i < 2; i++) {
         // x = LeakyReLU(0.1)(x)
@@ -1866,7 +2017,15 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
 
         // x_source = noise_convs[i](har); noise_res[i](x_source, s_dec)
         ggml_tensor* x_source;
-        if (i == 0) {
+        if (time_first) {
+            if (i == 0) {
+                x_source = kokoro_conv1d_ks_tf(ctx0, har, nc0_w, nc0_b, /*s*/ 6, /*p*/ 3);
+                x_source = kokoro_resblock1_forward_tf(ctx0, x_source, style, noise_res0, noise_a1[0], noise_a2[0]);
+            } else {
+                x_source = kokoro_conv1d_ks_tf(ctx0, har, nc1_w, nc1_b, /*s*/ 1, /*p*/ 0);
+                x_source = kokoro_resblock1_forward_tf(ctx0, x_source, style, noise_res1, noise_a1[1], noise_a2[1]);
+            }
+        } else if (i == 0) {
             // k=12, s=6, p=(s+1)/2=3
             x_source = kokoro_conv1d_ks(ctx0, har, nc0_w, nc0_b, /*s*/ 6, /*p*/ 3);
             x_source = kokoro_resblock1_forward(ctx0, x_source, style, noise_res0);
@@ -1877,7 +2036,13 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         }
 
         // x = ups[i](x)  with PyTorch padding handled via post-crop
-        if (i == 0) {
+        if (time_first) {
+            if (i == 0) {
+                x = kokoro_convt1d_pad_tf(ctx0, x, ups0_w, c->ups_w_perm[0], ups0_b, /*s*/ 10, /*p*/ 5);
+            } else {
+                x = kokoro_convt1d_pad_tf(ctx0, x, ups1_w, c->ups_w_perm[1], ups1_b, /*s*/ 6, /*p*/ 3);
+            }
+        } else if (i == 0) {
             // k=20, s=10, p=(k-s)/2 = 5
             x = kokoro_convt1d_pad(ctx0, x, ups0_w, c->ups_w_perm[0], ups0_b, /*s*/ 10, /*p*/ 5);
         } else {
@@ -1886,12 +2051,15 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         }
 
         // Last upsample: reflection_pad((1, 0)) — 1 sample on the left, 0 on the right.
-        // ggml_pad_reflect_1d works on the LAST dim (innermost), so transpose
-        // (C, T) → (T, C), pad along T, transpose back.
+        // ggml_pad_reflect_1d pads ne[0]; time-first is already (T, C).
         if (i == 1) {
-            ggml_tensor* xT = ggml_cont(ctx0, ggml_transpose(ctx0, x));  // (T, C)
-            xT = ggml_pad_reflect_1d(ctx0, xT, /*left=*/1, /*right=*/0); // (T+1, C)
-            x = ggml_cont(ctx0, ggml_transpose(ctx0, xT));               // (C, T+1)
+            if (time_first) {
+                x = ggml_pad_reflect_1d(ctx0, x, /*left=*/1, /*right=*/0); // (T+1, C)
+            } else {
+                ggml_tensor* xT = ggml_cont(ctx0, ggml_transpose(ctx0, x));   // (T, C)
+                xT = ggml_pad_reflect_1d(ctx0, xT, /*left=*/1, /*right=*/0); // (T+1, C)
+                x = ggml_cont(ctx0, ggml_transpose(ctx0, xT));               // (C, T+1)
+            }
         }
 
         x = ggml_add(ctx0, x, x_source);
@@ -1899,7 +2067,13 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         // Average of 3 resblocks at indices i*3+0, i*3+1, i*3+2.
         ggml_tensor* xs = nullptr;
         for (int j = 0; j < 3; j++) {
-            ggml_tensor* xj = kokoro_resblock1_forward(ctx0, x, style, resblocks[i * 3 + j]);
+            ggml_tensor* xj;
+            if (time_first) {
+                const int bi = i * 3 + j;
+                xj = kokoro_resblock1_forward_tf(ctx0, x, style, resblocks[bi], res_a1[bi], res_a2[bi]);
+            } else {
+                xj = kokoro_resblock1_forward(ctx0, x, style, resblocks[i * 3 + j]);
+            }
             xs = (xs == nullptr) ? xj : ggml_add(ctx0, xs, xj);
         }
         x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
@@ -1907,13 +2081,26 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
 
     // x = LeakyReLU(0.01)(x)  — default PyTorch slope, NOT 0.1.
     x = ggml_leaky_relu(ctx0, x, /*slope=*/0.01f, /*inplace=*/false);
-    ggml_tensor* gen_pre_post = ggml_cont(ctx0, x);
+
+    ggml_tensor* gen_pre_post;
+    if (time_first) {
+        // Named debug/output tensor stays channel-first (128, T_har) for layout
+        // compatibility; conv_post still consumes the live (T, C) activation.
+        gen_pre_post = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (128, T_har)
+    } else {
+        gen_pre_post = ggml_cont(ctx0, x);
+    }
     ggml_set_name(gen_pre_post, "gen_pre_post_out");
     ggml_set_output(gen_pre_post);
     ggml_build_forward_expand(gf, gen_pre_post);
 
     // conv_post: Conv1d(128, 22, k=7, p=3). Same-padding output length = T_har.
-    x = kokoro_conv1d_ks(ctx0, gen_pre_post, cp_w, cp_b, /*s*/ 1, /*p*/ 3); // (22, T_har)
+    if (time_first) {
+        x = kokoro_conv1d_ks_tf(ctx0, x, cp_w, cp_b, /*s*/ 1, /*p*/ 3); // (T_har, 22)
+        x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                   // (22, T_har)
+    } else {
+        x = kokoro_conv1d_ks(ctx0, gen_pre_post, cp_w, cp_b, /*s*/ 1, /*p*/ 3); // (22, T_har)
+    }
 
     // Split (22, T_har) along ne[0]: rows 0..10 = mag-side, 11..21 = phase-side.
     // View along ne[0] is non-contiguous (stride between rows mismatches ne[0]),

@@ -430,6 +430,62 @@ stage-timer improvement from removing one host round-trip plus one scheduler
 reset/submission — not as a claim that BERT/predictor FLOPs themselves got
 faster.
 
+### Generator time-first layout (Vulkan)
+
+The generator historically kept large activations in channel-first `(C, T)` and
+paid a contiguous transpose around every AdaIN (`ggml_norm` wants `(T, C)`) and
+every `ggml_conv_1d` (also `(T, C)`). Snake-α used `DIV` with broadcast
+`alpha=(C, 1)`, which cannot match Vulkan's fused Snake kernel.
+
+Vulkan Snake fusion requires the exact chain `MUL → SIN → SQR → MUL → ADD`,
+contiguous `x=(T, C)`, and F32 `a` / `inv_a` shaped `(1, C)`. A layout rewrite
+is therefore what makes both CONT-copy removal and Snake fusion possible; merely
+replacing `DIV` with `MUL` on the old `(C, T)` path is not enough.
+
+On `KOKORO_BACKEND_VULKAN` only, the generator now:
+
+- converts `x_in` / `har` from `(C, T)` to `(T, C)` once at the graph boundary;
+- runs AdaIN via `ggml_norm` directly on `(T, C)` with `(1, C)` gamma/beta;
+- keeps Conv1d residual paths in `(T, C)` without per-op transpose CONT;
+- emits Snake as `MUL→SIN→SQR→MUL→ADD` with graph-computed `(1, C)` reciprocal
+  (reciprocal nodes are expanded before the Snake chain so they do not break
+  fusion contiguity);
+- still converts at each decomposed ConvTranspose boundary via
+  `convt1d_decomp_tf` (GGML itself is unchanged);
+- converts back to channel-first only for the named `gen_pre_post_out` / mag /
+  phase outputs expected by CPU iSTFT.
+
+CPU keeps the historical channel-first builder and remains bit-identical to the
+cached golden. Metal/CUDA are unchanged for now.
+
+One-run F16/Q8_0 validation after this change (same hardware, seed, baseline
+text):
+
+| Model | Correlation | Relative RMS delta |
+|---|---:|---:|
+| F16 | `0.953395` | `0.304968` |
+| Q8_0 | `0.690435` | `0.785729` |
+
+These are small, deterministic shifts from the prior `0.953535` / `0.304508`
+and `0.690742` / `0.785317` baselines. They are expected because fused Snake
+changes floating-point evaluation order, and they are not being described as
+run-to-run noise. The first changed region is deliberately confined to the
+generator; earlier graphs are unchanged. Quick-mode CPU PCM stayed
+bit-identical to the cached reference.
+
+Six `KOKORO_BENCH=1` F16 runs on the RX 7900 XTX after the layout change:
+
+| Stage | Post-merge median | Time-first median |
+|---|---:|---:|
+| Generator | ~37–39 ms | 28.46 ms |
+| Complete synthesis pipeline | ~102–104 ms | 94.00 ms |
+
+Generator improved by about 25% versus the post-merge ~38 ms level. A
+`GGML_VK_PERF_LOGGER=1` capture of the two main generator splits showed fused
+`SNAKE MUL: 24` each (48 total), CONT reduced from ~100+102 to 4+4, snake
+`SIN`/`SQR`/`DIV` removed from those splits (one remaining `SIN` is phase), and
+reciprocal `DIV` isolated to a small prep split (`DIV: 48`).
+
 ### Phase B — stable intermediate-stage diagnostics
 
 Add a test-only observer or diagnostic executable that captures existing host
