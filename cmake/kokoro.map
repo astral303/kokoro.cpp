@@ -1,0 +1,6 @@
+{
+    global:
+        kokoro_*;
+    local:
+        *;
+};

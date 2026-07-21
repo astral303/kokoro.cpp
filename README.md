@@ -197,9 +197,38 @@ ctest  # run model-free tests
 
 | CMake Option | Default | Description |
 |--------------|---------|-------------|
-| `KOKORO_BUILD_CLI` | ON | Build kokoro-cli tool |
-| `KOKORO_BUILD_TESTS` | ON | Build and register tests |
+| `KOKORO_BUILD_CLI` | ON standalone, OFF as subproject | Build kokoro-cli tool |
+| `KOKORO_BUILD_TESTS` | ON standalone, OFF as subproject | Build and register tests |
 | `KOKORO_STATIC` | ON | Static library (propagates KOKORO_STATIC) |
+| `KOKORO_WERROR` | OFF | Treat warnings in kokoro.cpp sources as errors |
+| `KOKORO_GGML_DIR` | bundled `ggml/` | Use a compatible external ggml source checkout |
+
+### Embedding and external ggml
+
+When kokoro.cpp is added to another CMake project, CLI and test targets are
+disabled by default. Link the namespaced alias:
+
+```cmake
+add_subdirectory(path/to/kokoro.cpp)
+target_link_libraries(my_app PRIVATE kokoro::kokoro)
+```
+
+To build against a separate ggml checkout instead of the bundled submodule:
+
+```bash
+cmake -S . -B build -DKOKORO_GGML_DIR=/path/to/ggml
+```
+
+If the parent project has already created a `ggml` target, kokoro.cpp reuses it
+instead of calling `add_subdirectory()` again. Its source directory is normally
+inferred from the target. Set `KOKORO_GGML_DIR` explicitly if it cannot be
+inferred.
+
+The external checkout must be source-compatible with the bundled CrispStrobe
+ggml revision. kokoro.cpp uses Kokoro-specific graph operations and a private
+backend header, so an arbitrary upstream ggml release is not guaranteed to
+work. The bundled submodule remains the compatibility baseline and source of
+truth for the tested revision.
 
 ### Environment Variables
 

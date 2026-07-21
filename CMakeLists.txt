@@ -15,9 +15,18 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if(NOT CMAKE_BUILD_TYPE)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(KOKORO_STANDALONE ON)
+else()
+    set(KOKORO_STANDALONE OFF)
+endif()
+
+if(KOKORO_STANDALONE)
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+endif()
+
+if(KOKORO_STANDALONE AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
@@ -25,23 +34,72 @@ endif()
 # Options
 # ===========================================================================
 
-option(KOKORO_BUILD_CLI    "Build the kokoro-cli tool"    ON)
-option(KOKORO_BUILD_TESTS  "Build tests"                  ON)
+option(KOKORO_BUILD_CLI    "Build the kokoro-cli tool"    ${KOKORO_STANDALONE})
+option(KOKORO_BUILD_TESTS  "Build tests"                  ${KOKORO_STANDALONE})
 option(KOKORO_STATIC       "Build kokoro as a static lib" ON)
+option(KOKORO_WERROR       "Treat warnings in kokoro.cpp sources as errors" OFF)
+set(KOKORO_GGML_DIR "" CACHE PATH
+    "External ggml source checkout (default: bundled submodule)")
 
 # ===========================================================================
 # ggml (CPU-only)
 # ===========================================================================
 
-set(GGML_METAL  OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
-set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
-set(GGML_SYCL   OFF CACHE BOOL "" FORCE)
-set(GGML_RPC    OFF CACHE BOOL "" FORCE)
-set(GGML_OPENCL OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+function(_kokoro_add_ggml source_dir)
+    # Keep dependency settings local to this function so embedding kokoro.cpp
+    # does not overwrite a parent project's GGML_* or BUILD_SHARED_LIBS values.
+    set(GGML_BUILD_TESTS OFF)
+    set(GGML_BUILD_EXAMPLES OFF)
+    set(GGML_CPU ON)
+    set(GGML_METAL OFF)
+    set(GGML_CUDA OFF)
+    set(GGML_VULKAN OFF)
+    set(GGML_SYCL OFF)
+    set(GGML_RPC OFF)
+    set(GGML_OPENCL OFF)
+    set(BUILD_SHARED_LIBS OFF)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    add_subdirectory("${source_dir}" "${CMAKE_CURRENT_BINARY_DIR}/ggml"
+        EXCLUDE_FROM_ALL)
+endfunction()
 
-add_subdirectory(ggml)
+if(TARGET ggml)
+    message(STATUS "kokoro.cpp: using parent-provided ggml target")
+    if(NOT KOKORO_GGML_DIR)
+        get_target_property(_KOKORO_GGML_TARGET_DIR ggml SOURCE_DIR)
+        if(EXISTS "${_KOKORO_GGML_TARGET_DIR}/src/ggml-backend-impl.h")
+            set(KOKORO_GGML_DIR "${_KOKORO_GGML_TARGET_DIR}")
+        elseif(EXISTS "${_KOKORO_GGML_TARGET_DIR}/ggml-backend-impl.h")
+            get_filename_component(KOKORO_GGML_DIR
+                "${_KOKORO_GGML_TARGET_DIR}" DIRECTORY)
+        endif()
+    endif()
+else()
+    if(NOT KOKORO_GGML_DIR)
+        set(KOKORO_GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
+        message(STATUS "kokoro.cpp: using bundled ggml submodule")
+    else()
+        get_filename_component(KOKORO_GGML_DIR "${KOKORO_GGML_DIR}"
+            ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        message(STATUS "kokoro.cpp: using external ggml checkout: ${KOKORO_GGML_DIR}")
+    endif()
+
+    if(NOT EXISTS "${KOKORO_GGML_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "KOKORO_GGML_DIR is not a ggml source checkout: ${KOKORO_GGML_DIR}")
+    endif()
+    _kokoro_add_ggml("${KOKORO_GGML_DIR}")
+endif()
+
+# core/gguf_loader.cpp uses one private ggml backend header in addition to
+# ggml's public target includes. A source checkout is therefore required even
+# when the parent already provides the target.
+if(NOT KOKORO_GGML_DIR OR
+   NOT EXISTS "${KOKORO_GGML_DIR}/src/ggml-backend-impl.h")
+    message(FATAL_ERROR
+        "Cannot locate ggml private headers. Set KOKORO_GGML_DIR to the source "
+        "checkout used by the parent-provided ggml target.")
+endif()
 
 # ===========================================================================
 # espeak-ng (required, directly linked)
@@ -100,6 +158,17 @@ if(KOKORO_STATIC)
 else()
     add_library(kokoro SHARED ${KOKORO_SOURCES})
 endif()
+add_library(kokoro::kokoro ALIAS kokoro)
+set_target_properties(kokoro PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+if(NOT KOKORO_STATIC AND UNIX AND NOT APPLE)
+    target_link_options(kokoro PRIVATE
+        "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/kokoro.map")
+endif()
 
 target_include_directories(kokoro PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -107,7 +176,7 @@ target_include_directories(kokoro PUBLIC
 )
 target_include_directories(kokoro PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/ggml/src
+    ${KOKORO_GGML_DIR}/src
 )
 
 target_link_libraries(kokoro PUBLIC
@@ -118,6 +187,9 @@ target_link_libraries(kokoro PUBLIC
 # Strict warnings for project-owned code (not propagated to ggml)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(kokoro PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    if(KOKORO_WERROR)
+        target_compile_options(kokoro PRIVATE -Werror)
+    endif()
 endif()
 
 target_compile_definitions(kokoro PRIVATE
