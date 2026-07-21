@@ -226,6 +226,10 @@ The CLI exposes the same selection through `--backend` and `--device`.
 Vulkan builds require the Vulkan loader, headers, and a shader compiler
 (`glslc` or `glslangValidator`); CUDA builds require the CUDA toolkit.
 
+GPU optimisation goals, known graph hazards, current numerical baselines, and
+the quick/full CPU-to-GPU validation workflow are documented in
+[GPU_OPTIMIZATION.md](GPU_OPTIMIZATION.md).
+
 ### Embedding and external ggml
 
 When kokoro.cpp is added to another CMake project, CLI and test targets are

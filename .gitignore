@@ -6,6 +6,9 @@ build-*/
 *.dylib
 compile_commands.json
 .cache/
+.validation/
+__pycache__/
+*.pyc
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

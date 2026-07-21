@@ -277,4 +277,13 @@ if(KOKORO_BUILD_TESTS)
     target_link_libraries(test-c-api PRIVATE kokoro)
     set_target_properties(test-c-api PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME c-api COMMAND test-c-api)
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME backend-validation
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backend_validation.py
+        )
+    endif()
 endif()
