@@ -1,0 +1,76 @@
+THIRD-PARTY NOTICES AND PROVENANCE
+===================================
+
+kokoro.cpp — standalone CPU inference for Kokoro-82M TTS
+
+Provenance
+----------
+
+The inference code in this project is derived from CrispASR
+(https://github.com/CrispStrobe/CrispASR), which implements the Kokoro
+TTS runtime among many other speech models. The extraction:
+
+  - Preserves all inference-critical math (forward pass graphs, GGUF
+    tensor naming, tokenizer, iSTFT, SineGen) to ensure bit-equivalent
+    output with the upstream CrispASR implementation.
+  - Removes GPU backends, multi-model orchestration, caching, and
+    non-Kokoro code paths.
+  - Renames symbols from CRISPASR_*/crispasr_* to KOKORO_*/kokoro_*.
+  - Simplifies to require espeak-ng as a direct linked dependency.
+
+ggml (submodule)
+----------------
+
+  Source: https://github.com/CrispStrobe/ggml (fork of ggml-org/ggml)
+  Pin:    bfe8ea228d8134d03641c9fcf233a9931f3730de
+  License: MIT
+
+  The ggml tensor library provides the compute backend for all neural
+  network operations (conv, matmul, LSTM gates, attention).
+
+espeak-ng (linked dependency)
+-----------------------------
+
+  Source: https://github.com/espeak-ng/espeak-ng
+  License: GPLv3+
+
+  espeak-ng is used for text-to-phoneme conversion. It is linked
+  directly into the resulting binary (not loaded at runtime via dlopen).
+
+  IMPORTANT: Because espeak-ng is licensed under GPLv3+, any binary that
+  links this library (including the kokoro static library and the
+  kokoro-cli tool) is subject to the terms of the GNU General Public
+  License version 3 or later. This means:
+
+    1. The combined work must be distributed under GPLv3+ terms.
+    2. Complete corresponding source code must be made available.
+    3. Users must receive a copy of the GPL license.
+
+  If you need a non-GPL distribution, you must either:
+    - Replace espeak-ng with a permissively-licensed phonemizer, or
+    - Use the kokoro_synthesize_phonemes() API which accepts pre-computed
+      IPA input and does not invoke espeak-ng.
+
+  The kokoro library code itself (src/kokoro.cpp, src/phonemizer.cpp,
+  include/kokoro.h, etc.) is MIT-licensed. Only the act of linking with
+  espeak-ng creates GPL obligations on the combined binary.
+
+Kokoro-82M Model
+----------------
+
+  Source: https://huggingface.co/hexgrad/Kokoro-82M
+  License: Apache-2.0
+  Architecture: StyleTTS2 / iSTFTNet
+
+  The pre-trained model weights are NOT included in this repository.
+  Use models/download-model.sh to obtain them. The model's Apache-2.0
+  license permits commercial use.
+
+Voice Packs
+-----------
+
+  Source: https://huggingface.co/cstr/kokoro-voices-GGUF
+  License: Apache-2.0 (per hexgrad/Kokoro-82M upstream)
+
+  Voice packs are per-speaker style vectors stored as separate GGUF
+  files. They are NOT included in this repository.
