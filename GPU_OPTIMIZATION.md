@@ -372,6 +372,38 @@ These are end-to-end process times (model load, one synthesis, and WAV write),
 measured with four CPU threads on the hardware described above. They are not
 steady-state library benchmarks.
 
+With `KOKORO_BENCH=1`, the CLI installs a Kokoro log callback and reports
+synchronised pipeline-stage times. Five F16 runs of the baseline fixture on the
+RX 7900 XTX gave these representative medians:
+
+| Stage | Median |
+|---|---:|
+| BERT | 7.21 ms |
+| Predictor | 22.40 ms |
+| F0/noise | 15.27 ms |
+| Text encoder | 5.72 ms |
+| Decoder | 8.18 ms |
+| CPU harmonic source | 9.02 ms |
+| Generator | 39.32 ms |
+| CPU iSTFT | 1.08 ms |
+| Complete synthesis pipeline | 107.91 ms |
+
+The timer for each graph includes graph construction, scheduler allocation,
+execution, and its immediately required transfers. It excludes model loading,
+phonemisation, and WAV writing. This makes graph-merging experiments visible
+without conflating them with process startup.
+
+Run a directly inspectable profile with:
+
+```bash
+KOKORO_BENCH=1 KOKORO_SEED=1234 \
+  .validation/build-vulkan/kokoro-cli \
+  -m models/kokoro-82m-f16.gguf \
+  -v models/kokoro-voice-af_heart.gguf \
+  --backend vulkan --device 0 -o .validation/profile.wav \
+  "The documented Q Eight model works."
+```
+
 After replacing host duration/text expansion with device `ggml_get_rows`
 gathers (same hardware, seed, and baseline text), one-run F16/Q8_0 validation
 reproduced the same correlations and relative RMS deltas (`0.953535` /

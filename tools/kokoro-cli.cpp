@@ -9,6 +9,12 @@
 #include <cstring>
 #include <vector>
 
+static void cli_log(enum kokoro_log_level level, const char *message, void *user_data) {
+    (void)level;
+    (void)user_data;
+    fprintf(stderr, "%s\n", message);
+}
+
 static bool write_wav(const char *path, const float *pcm, int n_samples,
                       int sample_rate) {
     FILE *f = fopen(path, "wb");
@@ -98,6 +104,11 @@ int main(int argc, char **argv) {
     float length_scale = 1.0f;
     bool use_phonemes = false;
     enum kokoro_backend backend = KOKORO_BACKEND_AUTO;
+
+    const char *bench = getenv("KOKORO_BENCH");
+    if (bench && bench[0] != '\0' && bench[0] != '0') {
+        kokoro_log_set(cli_log, nullptr);
+    }
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {

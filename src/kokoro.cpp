@@ -150,16 +150,23 @@ bool kokoro_bench_enabled() {
     return v != 0;
 }
 
+using kokoro_bench_clock = std::chrono::steady_clock;
+
+void kokoro_bench_elapsed(const char* name, kokoro_bench_clock::time_point start) {
+    if (!kokoro_bench_enabled())
+        return;
+    const double ms = std::chrono::duration<double, std::milli>(
+                          kokoro_bench_clock::now() - start)
+                          .count();
+    kokoro_log(KOKORO_LOG_DEBUG, "kokoro: benchmark %-22s %.2f ms", name, ms);
+}
+
 struct kokoro_bench_stage {
     const char* name;
-    std::chrono::steady_clock::time_point t0;
-    explicit kokoro_bench_stage(const char* n) : name(n), t0(std::chrono::steady_clock::now()) {}
+    kokoro_bench_clock::time_point t0;
+    explicit kokoro_bench_stage(const char* n) : name(n), t0(kokoro_bench_clock::now()) {}
     ~kokoro_bench_stage() {
-        if (!kokoro_bench_enabled())
-            return;
-        auto t1 = std::chrono::steady_clock::now();
-        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        kokoro_log(KOKORO_LOG_DEBUG, "kokoro: benchmark %-22s %.2f ms", name, ms);
+        kokoro_bench_elapsed(name, t0);
     }
 };
 
@@ -2042,10 +2049,12 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
 // ---------------------------------------------------------------------------
 
 static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_ids, int n_raw, int* out_n) {
+    const auto pipeline_start = kokoro_bench_clock::now();
     if (out_n) *out_n = 0;
     if (!c->vp_loaded || n_raw <= 0) return nullptr;
 
     // --- Stage 1: BERT ---
+    auto stage_start = kokoro_bench_clock::now();
     std::vector<int32_t> padded;
     padded.reserve((size_t)n_raw + 2);
     padded.push_back(c->vocab.pad_id);
@@ -2071,8 +2080,10 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     const size_t bp_n = (size_t)bp_t->ne[0] * (size_t)bp_t->ne[1];
     std::vector<float> bert_proj(bp_n);
     ggml_backend_tensor_get(bp_t, bert_proj.data(), 0, bp_n * sizeof(float));
+    kokoro_bench_elapsed("bert", stage_start);
 
     // --- Stage 2: Predictor (produces dur_enc_out + durations) ---
+    stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_pred = kokoro_build_graph_predictor(c, L, n_raw);
     if (!gf_pred) return nullptr;
     ggml_backend_sched_reset(c->sched);
@@ -2090,6 +2101,9 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_tensor* dp_t = ggml_graph_get_tensor(gf_pred, "durations_pre");
     std::vector<float> dur_raw((size_t)L);
     ggml_backend_tensor_get(dp_t, dur_raw.data(), 0, (size_t)L * sizeof(float));
+    kokoro_bench_elapsed("predictor", stage_start);
+
+    stage_start = kokoro_bench_clock::now();
     const float length_scale = c->params.length_scale > 0.0f ? c->params.length_scale : 1.0f;
     std::vector<int> dur_int((size_t)L);
     for (int i = 0; i < L; i++) {
@@ -2104,8 +2118,10 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     int T_frames = 0;
     int32_t* align_idx = core_align::build_indices(L, dur_int.data(), &T_frames);
     if (!align_idx || T_frames <= 0) { std::free(align_idx); return nullptr; }
+    kokoro_bench_elapsed("duration_indices", stage_start);
 
     // --- Stage 4: F0/N prediction (gather dur_enc on device, then F0/N) ---
+    stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_f0n = kokoro_build_graph_f0n(c, T_frames, L, n_raw);
     if (!gf_f0n) { std::free(align_idx); return nullptr; }
     ggml_backend_sched_reset(c->sched);
@@ -2124,8 +2140,10 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     std::vector<float> f0_curve(fn_n), n_curve(fn_n);
     ggml_backend_tensor_get(f0_t, f0_curve.data(), 0, fn_n * sizeof(float));
     ggml_backend_tensor_get(n_t, n_curve.data(), 0, fn_n * sizeof(float));
+    kokoro_bench_elapsed("f0_noise", stage_start);
 
     // --- Stage 5: TextEncoder ---
+    stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_te = kokoro_build_graph_text_enc(c, L);
     if (!gf_te) { std::free(align_idx); return nullptr; }
     ggml_backend_sched_reset(c->sched);
@@ -2139,8 +2157,10 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     const size_t te_n = (size_t)te_t->ne[0] * (size_t)te_t->ne[1];
     std::vector<float> text_enc(te_n);
     ggml_backend_tensor_get(te_t, text_enc.data(), 0, te_n * sizeof(float));
+    kokoro_bench_elapsed("text_encoder", stage_start);
 
     // --- Stage 6+7: Decoder body (gather text_enc on device with same indices) ---
+    stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_dec = kokoro_build_graph_decoder_body(c, T_frames, L, n_raw);
     if (!gf_dec) { std::free(align_idx); return nullptr; }
     ggml_backend_sched_reset(c->sched);
@@ -2156,16 +2176,20 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     const size_t dec_n = (size_t)dec_out->ne[0] * (size_t)dec_out->ne[1];
     std::vector<float> dec_decode(dec_n);
     ggml_backend_tensor_get(dec_out, dec_decode.data(), 0, dec_n * sizeof(float));
+    kokoro_bench_elapsed("decoder", stage_start);
 
     // --- Stage 8: HnNSF (CPU-side har generation) ---
+    stage_start = kokoro_bench_clock::now();
     const char* seed_env = kokoro_env::get("KOKORO_SEED");
     uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
     std::mt19937 rng(seed);
     int T_har = 0;
     float* har = kokoro_make_har(c, f0_curve.data(), T_frames, &T_har, rng);
     if (!har) return nullptr;
+    kokoro_bench_elapsed("harmonic_source", stage_start);
 
     // --- Stage 9: Generator (produces mag + phase in one graph) ---
+    stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_gen = kokoro_build_graph_generator(c, T_frames, T_har, n_raw);
     if (!gf_gen) { std::free(har); return nullptr; }
     ggml_backend_sched_reset(c->sched);
@@ -2182,12 +2206,14 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     std::vector<float> mag(mp_n), phase(mp_n);
     ggml_backend_tensor_get(mag_t, mag.data(), 0, mp_n * sizeof(float));
     ggml_backend_tensor_get(phase_t, phase.data(), 0, mp_n * sizeof(float));
+    kokoro_bench_elapsed("generator", stage_start);
 
     // --- Stage 10: iSTFT (CPU) ---
     int T_audio = 0;
     float* audio = kokoro_run_istft(mag.data(), phase.data(), T_har, &T_audio);
     if (!audio) return nullptr;
     if (out_n) *out_n = T_audio;
+    kokoro_bench_elapsed("pipeline_total", pipeline_start);
     return audio;
 }
 
