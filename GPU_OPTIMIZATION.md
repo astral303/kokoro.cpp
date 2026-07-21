@@ -540,6 +540,60 @@ that as an observed scheduling effect, not as a change to generator graph math:
 removing the CPU-only gap keeps the Vulkan queue busy immediately before the
 generator and likely avoids device clock/queue warm-up loss.
 
+### Bidirectional LSTM direction batching (Vulkan)
+
+Every Kokoro bidirectional LSTM previously ran `lstm_unidir` twice (forward,
+then reverse), duplicating recurrent `mul_mat` and gate elementwise dispatches
+per timestep. On `KOKORO_BACKEND_VULKAN` only, both directions now share GGML
+batch dimension `ne[2]=2`:
+
+- stack forward `X` with a time-reversed gather of `X` (I32 indices from
+  `arange` → negate/offset → cast);
+- graph-concat forward/reverse `W_ih` / `W_hh` / biases on `ne[2]` (no
+  persistent prepack);
+- project once to `(4H, T, 2)` and recur on `h`/`c` shaped `(H, 1, 2)` so each
+  timestep's matmul and gate ops cover both directions;
+- assemble `(2H, T)` functionally: forward at `t`, reverse at `T-1-t` via the
+  same reverse gather (no cpy-to-view mutation).
+
+CPU/Metal/CUDA keep the historical dual-unidir path. `KOKORO_LSTM_BATCH=0`
+disables the batched path for A/B measurement. F32 matmul precision hints are
+unchanged.
+
+Correctness after this change (same hardware, seed, baseline text; graph
+optimiser enabled):
+
+| Model | Correlation | Relative RMS delta |
+|---|---:|---:|
+| F16 | `0.953395` | `0.304968` |
+| Q8_0 | `0.690435` | `0.785729` |
+
+These match the post-overlap baseline exactly. Quick-mode CPU PCM stayed
+bit-identical to the cached golden. Twelve interleaved
+`KOKORO_LSTM_BATCH=0/1` Vulkan pairs produced bit-identical WAVs. A CPU unit
+comparison of dual-unidir vs batched biLSTM also matched bit-for-bit.
+
+Twelve interleaved `KOKORO_BENCH=1` F16 pairs on the RX 7900 XTX:
+
+| Stage | Dual-unidir median | Batched median |
+|---|---:|---:|
+| `bert_predictor` | 27.05 ms | 19.86 ms |
+| `f0_noise` | 13.86 ms | 10.43 ms |
+| `text_encoder` | 5.22 ms | 3.64 ms |
+| Complete synthesis pipeline | 75.44 ms | 64.58 ms |
+
+Pipeline median improved by 10.86 ms (paired median delta −11.33 ms; every
+paired run ≤ −9.28 ms). `GGML_VK_PERF_LOGGER=1` op-count changes for the same
+fixture:
+
+| Op | Dual-unidir | Batched | Delta |
+|---|---:|---:|---:|
+| `MUL_MAT_VEC*` (matvec) | 721 | 399 | −322 |
+| `MUL` | 2066 | 1088 | −978 |
+| `SIGMOID` | 1957 | 979 | −978 |
+| `TANH` | 1312 | 656 | −656 |
+| `CONCAT` | 674 | 382 | −292 |
+
 ### Phase B — stable intermediate-stage diagnostics
 
 Add a test-only observer or diagnostic executable that captures existing host

@@ -618,6 +618,15 @@ static inline ggml_tensor* kokoro_adaln(ggml_context* ctx, ggml_tensor* x, ggml_
 static const float kTextEncLayerNormEps = 1e-5f;
 static const float kTextEncLeakySlope = 0.2f;
 
+// Vulkan packs bidirectional LSTM forward/reverse directions on GGML batch
+// dimension ne[2]=2 so recurrent matmuls and gate ops are shared. CPU/Metal/
+// CUDA keep the historical dual-unidir path for bit-identity. KOKORO_LSTM_BATCH=0
+// disables the batched path for A/B measurement.
+static inline bool kokoro_lstm_batch_dirs(const kokoro_context* c) {
+    return c->selected_backend == KOKORO_BACKEND_VULKAN &&
+           (kokoro_env::get("KOKORO_LSTM_BATCH") == nullptr || kokoro_env::truthy("KOKORO_LSTM_BATCH"));
+}
+
 static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
     const auto& hp = c->hp;
     const int D = (int)hp.hidden_dim; // 512
@@ -691,7 +700,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 
     ggml_tensor* lstm_out =
         core_lstm::lstm_bidir(ctx0, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
-                              H_lstm); // (2H = D, L)
+                              H_lstm, kokoro_lstm_batch_dirs(c)); // (2H = D, L)
 
     ggml_set_name(lstm_out, "text_enc_out");
     ggml_set_output(lstm_out);
@@ -1049,7 +1058,7 @@ static void kokoro_graph_append_predictor(ggml_context* ctx0, ggml_cgraph* gf, k
         ggml_tensor* b_hh_r = require(c, buf);
 
         x = core_lstm::lstm_bidir(ctx0, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
-                                  H_lstm); // (512, L)
+                                  H_lstm, kokoro_lstm_batch_dirs(c)); // (512, L)
 
         std::snprintf(buf, sizeof(buf), "pred.dur_enc.%d.adaln.weight", il);
         ggml_tensor* fc_w = require(c, buf);
@@ -1076,8 +1085,9 @@ static void kokoro_graph_append_predictor(ggml_context* ctx0, ggml_cgraph* gf, k
     ggml_tensor* pl_b_ih_r = require(c, "pred.lstm.bias_ih_l0_reverse");
     ggml_tensor* pl_b_hh_r = require(c, "pred.lstm.bias_hh_l0_reverse");
 
-    ggml_tensor* pl_out = core_lstm::lstm_bidir(ctx0, dur_enc_out, pl_W_ih_f, pl_W_hh_f, pl_b_ih_f, pl_b_hh_f,
-                                                pl_W_ih_r, pl_W_hh_r, pl_b_ih_r, pl_b_hh_r, H_lstm); // (512, L)
+    ggml_tensor* pl_out =
+        core_lstm::lstm_bidir(ctx0, dur_enc_out, pl_W_ih_f, pl_W_hh_f, pl_b_ih_f, pl_b_hh_f, pl_W_ih_r, pl_W_hh_r,
+                              pl_b_ih_r, pl_b_hh_r, H_lstm, kokoro_lstm_batch_dirs(c)); // (512, L)
     ggml_set_name(pl_out, "pred_lstm_out");
     ggml_set_output(pl_out);
 
@@ -1171,9 +1181,9 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     ggml_tensor* sh_b_ih_r = require(c, "pred.shared.bias_ih_l0_reverse");
     ggml_tensor* sh_b_hh_r = require(c, "pred.shared.bias_hh_l0_reverse");
 
-    ggml_tensor* shared_out = core_lstm::lstm_bidir(ctx0, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f, sh_W_ih_r,
-                                                    sh_W_hh_r, sh_b_ih_r, sh_b_hh_r,
-                                                    H_lstm); // (512, T_frames)
+    ggml_tensor* shared_out =
+        core_lstm::lstm_bidir(ctx0, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f, sh_W_ih_r, sh_W_hh_r, sh_b_ih_r,
+                              sh_b_hh_r, H_lstm, kokoro_lstm_batch_dirs(c)); // (512, T_frames)
     // Named output for diagnostics.
     ggml_set_name(shared_out, "pred_shared_out");
     ggml_set_output(shared_out);
