@@ -57,6 +57,7 @@ Kokoro-82M Model
 ----------------
 
   Source: https://huggingface.co/hexgrad/Kokoro-82M
+  GGUF distribution: https://huggingface.co/simonfxr/kokoro.cpp-GGUF
   License: Apache-2.0
   Architecture: StyleTTS2 / iSTFTNet
 
@@ -67,8 +68,10 @@ Kokoro-82M Model
 Voice Packs
 -----------
 
-  Source: https://huggingface.co/cstr/kokoro-voices-GGUF
-  License: Apache-2.0 (per hexgrad/Kokoro-82M upstream)
+  Source: https://huggingface.co/hexgrad/Kokoro-82M/tree/main/voices
+  License: Apache-2.0
 
   Voice packs are per-speaker style vectors stored as separate GGUF
-  files. They are NOT included in this repository.
+  files. They are NOT included in this repository. The conversion scripts are
+  derived from CrispASR's MIT-licensed converters and retain its GGUF naming
+  and metadata contract.

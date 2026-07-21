@@ -2,6 +2,7 @@
 
 Standalone C/C++ inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) text-to-speech, powered by [ggml](https://github.com/ggml-org/ggml).
 
+- **Models** — [F16, Q8_0, and all 54 official voices on Hugging Face](https://huggingface.co/simonfxr/kokoro.cpp-GGUF)
 - **CPU and GPU** — CPU fallback plus Vulkan, Metal, and CUDA backends
 - **C ABI** — suitable for cgo, FFI, Python ctypes, Rust bindgen
 - **24 kHz mono** — non-autoregressive, full-utterance synthesis
@@ -112,8 +113,49 @@ sentence-level streaming by splitting text and synthesizing each sentence.
 
 ## Model Compatibility
 
-The runtime consumes the GGUF files published by CrispASR's `cstr` account.
-Model and voice files are separate and both are required.
+The runtime consumes GGUF converted from the official
+[`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) v1.0
+checkpoint. Model and voice files are separate and both are required. The
+official [`simonfxr/kokoro.cpp-GGUF`](https://huggingface.co/simonfxr/kokoro.cpp-GGUF)
+repository publishes both model variants and all 54 voices produced by this
+repository's reproducible conversion workflow.
+
+### Convert the official weights
+
+The conversion workflow pins the upstream revision and verifies the published
+checkpoint SHA256
+`496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4`.
+
+```bash
+python3 -m venv .venv-convert
+. .venv-convert/bin/activate
+python3 -m pip install -r models/requirements-convert.txt
+
+# Downloads config.json, kokoro-v1_0.pth, and all 54 voices, then converts them.
+./models/convert-original.sh
+```
+
+Outputs are written to `models/generated/`:
+
+- `kokoro-82m-f16.gguf` — reference model.
+- `kokoro-82m-q8_0.gguf` — 111 eligible 2-D matrix weights in Q8_0;
+  convolutions/recurrent tensors that cannot use block quantization remain F16,
+  and rank-1 tensors remain F32.
+- `voices/kokoro-voice-*.gguf` — all 54 voice packs, retained as F32.
+- `manifest.json` — source revision plus output sizes and SHA256 hashes.
+
+Pass source and output directories to override the defaults:
+
+```bash
+./models/convert-original.sh /data/Kokoro-82M /data/kokoro-gguf
+```
+
+The lower-level `convert-kokoro-to-gguf.py` (`f32`, `f16`, or `q8_0`) and
+`convert-kokoro-voices-to-gguf.py` scripts can also be run independently.
+Tensor-level size/error statistics and fixed-seed waveform/spectral comparisons
+against the cstr files are recorded in
+[`models/VALIDATION.md`](models/VALIDATION.md). Re-run them with
+`tools/compare_gguf.py` and `tools/compare_model_outputs.py`.
 
 ### Verified in this repository
 
@@ -122,14 +164,15 @@ produce valid 24 kHz WAV files:
 
 | Model file | Size | Voice file | Result |
 |------------|------|------------|--------|
-| [`kokoro-82m-f16.gguf`](https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main/kokoro-82m-f16.gguf) | 163,728,096 bytes (156 MiB) | [`kokoro-voice-af_heart.gguf`](https://huggingface.co/cstr/kokoro-voices-GGUF/resolve/main/kokoro-voice-af_heart.gguf) | Verified |
-| [`kokoro-82m-q8_0.gguf`](https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main/kokoro-82m-q8_0.gguf) | 141,322,336 bytes (135 MiB) | `kokoro-voice-af_heart.gguf` | Verified |
+| [`kokoro-82m-f16.gguf`](https://huggingface.co/simonfxr/kokoro.cpp-GGUF/resolve/main/kokoro-82m-f16.gguf) | 163,728,096 bytes (156 MiB) | [`kokoro-voice-af_heart.gguf`](https://huggingface.co/simonfxr/kokoro.cpp-GGUF/resolve/main/voices/kokoro-voice-af_heart.gguf) | Verified |
+| [`kokoro-82m-q8_0.gguf`](https://huggingface.co/simonfxr/kokoro.cpp-GGUF/resolve/main/kokoro-82m-q8_0.gguf) | 141,322,752 bytes (135 MiB) | `kokoro-voice-af_heart.gguf` | Verified |
 
 Download either verified model with:
 
 ```bash
 ./models/download-model.sh f16
 ./models/download-model.sh q8_0
+./models/download-model.sh q8_0 ef_dora  # choose any official voice
 # Equivalent: KOKORO_QUANT=q8_0 ./models/download-model.sh
 ```
 
@@ -142,24 +185,39 @@ XTX. Fixed-seed CPU and Vulkan output had identical duration and transcription
 but was not PCM-identical, as expected from backend-specific floating-point
 execution.
 
-### Published voice packs
+### Official languages and voices
 
-The [`cstr/kokoro-voices-GGUF`](https://huggingface.co/cstr/kokoro-voices-GGUF)
-repository currently publishes:
+Kokoro v1.0 officially supports eight languages and 54 voices. The Python
+pipeline distinguishes American and British English, yielding nine language
+codes. The CLI `-l` value is the corresponding espeak-ng voice, not Kokoro's
+one-letter pipeline code.
 
-| File | Intended language | Validation here |
-|------|-------------------|-----------------|
-| `kokoro-voice-af_heart.gguf` | American English | Verified with F16 and Q8_0 |
-| `kokoro-voice-ef_dora.gguf` | Spanish | Format-compatible; not tested here |
-| `kokoro-voice-ff_siwis.gguf` | French | Format-compatible; not tested here |
-| `kokoro-voice-df_eva.gguf` | German | Format-compatible; not tested here |
-| `kokoro-voice-df_victoria.gguf` | German | Format-compatible; not tested here |
-| `kokoro-voice-dm_bernd.gguf` | German | Format-compatible; not tested here |
-| `kokoro-voice-dm_martin.gguf` | German | Format-compatible; not tested here |
+| Language | Kokoro code | CLI `-l` | Voices |
+|----------|-------------|----------|-------:|
+| American English | `a` | `en-us` | 20 |
+| British English | `b` | `en-gb` | 8 |
+| Spanish | `e` | `es` | 3 |
+| French | `f` | `fr-fr` | 1 |
+| Hindi | `h` | `hi` | 4 |
+| Italian | `i` | `it` | 2 |
+| Japanese | `j` | `ja` | 5 |
+| Brazilian Portuguese | `p` | `pt-br` | 3 |
+| Mandarin Chinese | `z` | `cmn` | 8 |
 
-“Format-compatible” means the file uses the required `kokoro-voice`
-architecture and `voice.pack` layout; it is not a claim that this project has
-quality-tested the voice.
+The exact names and mapping are machine-readable in
+[`models/languages.json`](models/languages.json). For example:
+
+```bash
+./build/kokoro-cli -m models/generated/kokoro-82m-q8_0.gguf \
+  -v models/generated/voices/kokoro-voice-ef_dora.gguf \
+  -l es "Hola, esta es una prueba en español."
+```
+
+The generated F16 and Q8_0 models and generated `af_heart`/`ef_dora` packs have
+been load- and synthesis-tested in this repository. Other generated packs share
+the same validated F32 layout but have not all received subjective audio-quality
+review. GGUF tools expose each voice tensor in GGML dimension order
+`(256, 1, 510)`; the source PyTorch tensor is `(510, 1, 256)`.
 
 ### German backbone (not yet validated here)
 
@@ -185,10 +243,8 @@ or `dm_*` voice and select an espeak-ng German voice such as `-l de`.
 - **Output**: model-declared sample rate, currently 24 kHz; mono float32 PCM.
 - **Supported published weight types**: F16 and Q8_0 files listed above.
   Other quantizations are unvalidated and unsupported.
-- **Not directly supported**: raw PyTorch `.pth`/`.pt` checkpoints. Convert
-  them with CrispASR's `convert-kokoro-to-gguf.py` and
-  `convert-kokoro-voice-to-gguf.py`, preserving the expected metadata and
-  tensor names.
+- **Not directly supported at runtime**: raw PyTorch `.pth`/`.pt` checkpoints.
+  Convert them with the scripts under `models/`.
 
 ### GGUF format
 

@@ -17,6 +17,8 @@ Makefile
 # Models (downloaded, not committed)
 models/*.gguf
 models/*.bin
+models/generated/
+models/original/
 
 # Editor
 .vscode/

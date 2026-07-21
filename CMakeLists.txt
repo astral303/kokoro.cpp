@@ -312,5 +312,10 @@ if(KOKORO_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_backend_validation.py
         )
+        add_test(
+            NAME model-conversion-manifest
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_conversion.py
+        )
     endif()
 endif()

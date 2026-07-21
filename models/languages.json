@@ -1,0 +1,72 @@
+{
+  "source": "hexgrad/Kokoro-82M",
+  "revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+  "checkpoint_sha256": "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4",
+  "languages": [
+    {
+      "name": "American English",
+      "kokoro_code": "a",
+      "espeak_voice": "en-us",
+      "voices": [
+        "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica",
+        "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+        "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
+        "am_michael", "am_onyx", "am_puck", "am_santa"
+      ]
+    },
+    {
+      "name": "British English",
+      "kokoro_code": "b",
+      "espeak_voice": "en-gb",
+      "voices": [
+        "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+        "bm_daniel", "bm_fable", "bm_george", "bm_lewis"
+      ]
+    },
+    {
+      "name": "Spanish",
+      "kokoro_code": "e",
+      "espeak_voice": "es",
+      "voices": ["ef_dora", "em_alex", "em_santa"]
+    },
+    {
+      "name": "French",
+      "kokoro_code": "f",
+      "espeak_voice": "fr-fr",
+      "voices": ["ff_siwis"]
+    },
+    {
+      "name": "Hindi",
+      "kokoro_code": "h",
+      "espeak_voice": "hi",
+      "voices": ["hf_alpha", "hf_beta", "hm_omega", "hm_psi"]
+    },
+    {
+      "name": "Italian",
+      "kokoro_code": "i",
+      "espeak_voice": "it",
+      "voices": ["if_sara", "im_nicola"]
+    },
+    {
+      "name": "Japanese",
+      "kokoro_code": "j",
+      "espeak_voice": "ja",
+      "voices": ["jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"]
+    },
+    {
+      "name": "Brazilian Portuguese",
+      "kokoro_code": "p",
+      "espeak_voice": "pt-br",
+      "voices": ["pf_dora", "pm_alex", "pm_santa"]
+    },
+    {
+      "name": "Mandarin Chinese",
+      "kokoro_code": "z",
+      "espeak_voice": "cmn",
+      "voices": [
+        "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+        "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang"
+      ]
+    }
+  ]
+}

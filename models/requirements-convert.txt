@@ -1,0 +1,5 @@
+# Model conversion only; these are not runtime dependencies.
+gguf>=0.17.1,<0.18
+huggingface-hub>=0.33,<2
+numpy>=1.26,<2
+torch>=2.1

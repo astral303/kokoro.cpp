@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Download Kokoro-82M GGUF model and default voice pack.
+# Download Kokoro-82M GGUF model and an official voice pack.
 #
 # Usage:
-#   ./download-model.sh              # downloads f16 (default)
-#   ./download-model.sh q8_0         # downloads q8_0 quantisation
+#   ./download-model.sh                    # f16 + af_heart (defaults)
+#   ./download-model.sh q8_0 ef_dora       # q8_0 + Spanish ef_dora
 #   KOKORO_QUANT=q8_0 ./download-model.sh
+#   KOKORO_VOICE=ff_siwis ./download-model.sh
 #
 # Supported quantisations: f16 (default), q8_0
-# Models hosted on Hugging Face: cstr/kokoro-82m-GGUF, cstr/kokoro-voices-GGUF
+# Models and all 54 voices:
+# https://huggingface.co/simonfxr/kokoro.cpp-GGUF
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,9 +22,15 @@ case "$QUANT" in
     *)     echo "Error: unsupported quantisation '$QUANT' (use f16 or q8_0)" >&2; exit 1 ;;
 esac
 
-HF_MODEL="https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main"
-HF_VOICES="https://huggingface.co/cstr/kokoro-voices-GGUF/resolve/main"
-VOICE_FILE="kokoro-voice-af_heart.gguf"
+HF_REPO="https://huggingface.co/simonfxr/kokoro.cpp-GGUF/resolve/main"
+VOICE="${2:-${KOKORO_VOICE:-af_heart}}"
+VOICE="${VOICE#kokoro-voice-}"
+VOICE="${VOICE%.gguf}"
+if [[ ! "$VOICE" =~ ^[a-z][fm]_[a-z0-9_]+$ ]]; then
+    echo "Error: invalid voice name '$VOICE'" >&2
+    exit 1
+fi
+VOICE_FILE="kokoro-voice-$VOICE.gguf"
 
 download() {
     local url="$1" dest="$2"
@@ -45,8 +53,8 @@ download() {
 }
 
 mkdir -p "$MODEL_DIR"
-download "$HF_MODEL/$MODEL_FILE" "$MODEL_DIR/$MODEL_FILE"
-download "$HF_VOICES/$VOICE_FILE" "$MODEL_DIR/$VOICE_FILE"
+download "$HF_REPO/$MODEL_FILE" "$MODEL_DIR/$MODEL_FILE"
+download "$HF_REPO/voices/$VOICE_FILE" "$MODEL_DIR/$VOICE_FILE"
 
 echo ""
 echo "Done. Model files in: $MODEL_DIR"
