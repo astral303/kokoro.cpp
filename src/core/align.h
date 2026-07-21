@@ -7,22 +7,52 @@
 // are repeated `dur[i]` times. PyTorch reference:
 //
 //   indices = torch.repeat_interleave(torch.arange(L), durations)
-//   en      = features.transpose(-1, -2) @ one_hot(indices, L)
+//   en      = features[:, indices]   # or features.T @ one_hot(indices, L)
 //
-// The matmul-with-one-hot formulation is what the reference dumpers
-// emit, but it's a wasteful way to compute it on CPU (O(L · T_frames)
-// memory for the alignment matrix) when the same answer comes from a
-// straight memcpy loop.
+// On device graphs the gather form is preferred: upload compact (D, L)
+// features plus an int32 index vector of length T_frames, then
+// ggml_get_rows(features, indices) → (D, T_frames). build_indices()
+// constructs that index vector on the host after duration rounding.
 //
-// This helper does the memcpy version. Output buffer is malloc'd —
-// caller frees with `free()`.
+// repeat_interleave() keeps the older CPU memcpy expansion for tests
+// and reference comparisons. Output buffers are malloc'd — caller
+// frees with `free()`.
 
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
 namespace core_align {
+
+// Build the gather index vector for duration alignment:
+//   indices = repeat_interleave(arange(L), durations)
+// Returns a malloc'd I32 buffer of length T_frames = sum(durations);
+// writes T_frames to *out_T_frames. Returns nullptr (and
+// *out_T_frames=0) on empty input or allocation failure.
+static inline int32_t* build_indices(int L, const int* durations, int* out_T_frames) {
+    int T = 0;
+    for (int i = 0; i < L; i++)
+        T += durations[i];
+    if (out_T_frames)
+        *out_T_frames = T;
+    if (T <= 0)
+        return nullptr;
+    int32_t* out = (int32_t*)std::malloc((size_t)T * sizeof(int32_t));
+    if (!out) {
+        if (out_T_frames)
+            *out_T_frames = 0;
+        return nullptr;
+    }
+    int j = 0;
+    for (int i = 0; i < L; i++) {
+        const int n = durations[i];
+        for (int k = 0; k < n; k++)
+            out[j++] = (int32_t)i;
+    }
+    return out;
+}
 
 // Repeat-interleave a (D, L) channel-major feature matrix according to
 // per-token integer durations. Returns a malloc'd (D, T_frames) F32
@@ -32,7 +62,8 @@ namespace core_align {
 //
 // Layout: features[i] is the i-th token's column at offset i·D in the
 // flat buffer, matching ggml's ne=(D, L) storage. The output preserves
-// the same channel-major layout.
+// the same channel-major layout. Equivalent to
+// ggml_get_rows(features, build_indices(...)) on contiguous F32 data.
 static inline float* repeat_interleave(const float* features, int D, int L, const int* durations, int* out_T_frames) {
     int T = 0;
     for (int i = 0; i < L; i++)

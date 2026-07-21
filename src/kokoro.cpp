@@ -648,25 +648,17 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 
 
 // ---------------------------------------------------------------------------
-// M6 — Alignment (CPU)
+// M6 — Alignment
 //
 // Reference (model.py:110-114):
 //   indices = repeat_interleave(arange(L), pred_dur)
-//   aln[indices, arange(T_frames)] = 1
-//   en = d.transpose(-1, -2) @ aln       # (640, T_frames)
+//   en = d[:, indices]                  # (640, T_frames)
 //
-// The matmul is just a column-repeat: en[:, j] = d[:, indices[j]]. We
-// implement that directly to avoid materialising the (L, T_frames) one-hot
-// alignment matrix.
-//
-// features:  (D, L) F32 input
-// durations: (L,)   integer counts
-// Returns malloc'd (D, T_frames) F32 buffer with T_frames = sum(durations).
+// Durations are still rounded on the host (dynamic T_frames). The host
+// builds a compact I32 index vector of length T_frames; F0/N and decoder
+// graphs then gather with ggml_get_rows so the large (D, T_frames)
+// expansions are never materialised on the CPU or uploaded over PCIe.
 // ---------------------------------------------------------------------------
-
-static inline float* kokoro_align_repeat(const float* features, int D, int L, const int* durations, int* out_T_frames) {
-    return core_align::repeat_interleave(features, D, L, durations, out_T_frames);
-}
 
 // ---------------------------------------------------------------------------
 // AdaIN1d (used by AdainResBlk1d in M5b predictor F0/N stacks and M7
@@ -1081,7 +1073,7 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
 // Final F0 / N curves are 1D length 2*T_frames.
 // ---------------------------------------------------------------------------
 
-static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int L_raw) {
+static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int L, int L_raw) {
     const auto& hp = c->hp;
     const int D = (int)hp.hidden_dim; // 512
     const int H_lstm = D / 2;         // 256
@@ -1092,10 +1084,18 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     // 6 AdainResBlk1d (3 F0 + 3 N), each ~25 ops. 1024-node margin.
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
 
-    // ---- Input ----
-    ggml_tensor* en = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, /*ne0=D+sty=*/640, T_frames);
-    ggml_set_name(en, "en");
-    ggml_set_input(en);
+    // ---- Inputs: compact dur_enc (640, L) + I32 gather indices (T_frames) ----
+    // ggml_get_rows selects along ne1 of a (ne0=D, ne1=L) matrix, so
+    // en[:, j] = dur_enc[:, align_idx[j]] → (640, T_frames).
+    ggml_tensor* dur_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, /*ne0=D+sty=*/640, L);
+    ggml_set_name(dur_enc, "dur_enc");
+    ggml_set_input(dur_enc);
+
+    ggml_tensor* align_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_frames);
+    ggml_set_name(align_idx, "align_idx");
+    ggml_set_input(align_idx);
+
+    ggml_tensor* en = ggml_get_rows(ctx0, dur_enc, align_idx); // (640, T_frames)
 
     // ---- Style: bake voice-pack predictor slice ----
     ggml_tensor* style_pred = kokoro_voice_style_pred_view(ctx0, c, L_raw); // (128, 1) F32
@@ -1286,18 +1286,23 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
 // the predictor's [128:256]).
 // ---------------------------------------------------------------------------
 
-static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_frames, int L_raw) {
+static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_frames, int L, int L_raw) {
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
     ggml_context* ctx0 = ggml_init(ip);
     // Decoder body has no LSTMs, just convs+AdaIN+LeakyReLU. ~50 ops/block × 5 blocks
     // + a few cat/F0_conv/asr_res steps. 16k node budget is generous.
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 32768, false);
 
-    // ---- Inputs (asr, F0_curve, N_curve from upstream stages) ----
-    // asr ne=(512, T_frames) — duration-aligned text_enc_out
-    ggml_tensor* asr_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 512, T_frames);
-    ggml_set_name(asr_in, "asr");
-    ggml_set_input(asr_in);
+    // ---- Inputs (compact text_enc + align indices, F0/N curves) ----
+    // text_enc ne=(512, L); align_idx ne=(T_frames,) I32
+    // asr = ggml_get_rows(text_enc, align_idx) → (512, T_frames)
+    ggml_tensor* text_enc_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 512, L);
+    ggml_set_name(text_enc_in, "text_enc");
+    ggml_set_input(text_enc_in);
+    ggml_tensor* align_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_frames);
+    ggml_set_name(align_idx, "align_idx");
+    ggml_set_input(align_idx);
+    ggml_tensor* asr_in = ggml_get_rows(ctx0, text_enc_in, align_idx); // (512, T_frames)
     // F0_curve ne=(2*T_frames,) → unsqueeze to (1, 2*T_frames) before F0_conv
     ggml_tensor* f0_in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, 2 * T_frames);
     ggml_set_name(f0_in, "f0");
@@ -2093,19 +2098,24 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
         dur_int[i] = (int)v;
     }
 
-    // --- Stage 3: Alignment (CPU) ---
+    // --- Stage 3: host duration rounding → compact I32 alignment indices ---
+    // T_frames is data-dependent; only the small duration vector must sync.
+    // Index length must equal T_frames for both later gathers.
     int T_frames = 0;
-    float* en = kokoro_align_repeat(dur_enc.data(), 640, L, dur_int.data(), &T_frames);
-    if (!en || T_frames <= 0) { std::free(en); return nullptr; }
+    int32_t* align_idx = core_align::build_indices(L, dur_int.data(), &T_frames);
+    if (!align_idx || T_frames <= 0) { std::free(align_idx); return nullptr; }
 
-    // --- Stage 4: F0/N prediction (produces f0_curve + n_curve in one graph) ---
-    ggml_cgraph* gf_f0n = kokoro_build_graph_f0n(c, T_frames, n_raw);
-    if (!gf_f0n) { std::free(en); return nullptr; }
+    // --- Stage 4: F0/N prediction (gather dur_enc on device, then F0/N) ---
+    ggml_cgraph* gf_f0n = kokoro_build_graph_f0n(c, T_frames, L, n_raw);
+    if (!gf_f0n) { std::free(align_idx); return nullptr; }
     ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf_f0n)) { std::free(en); return nullptr; }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_f0n, "en"), en, 0, (size_t)640 * T_frames * sizeof(float));
-    std::free(en);
-    if (ggml_backend_sched_graph_compute(c->sched, gf_f0n) != GGML_STATUS_SUCCESS) return nullptr;
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_f0n)) { std::free(align_idx); return nullptr; }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_f0n, "dur_enc"), dur_enc.data(), 0, de_n * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_f0n, "align_idx"), align_idx, 0, (size_t)T_frames * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(c->sched, gf_f0n) != GGML_STATUS_SUCCESS) {
+        std::free(align_idx);
+        return nullptr;
+    }
 
     // Extract both f0 and n curves
     ggml_tensor* f0_t = ggml_graph_get_tensor(gf_f0n, "f0_curve");
@@ -2117,30 +2127,29 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
 
     // --- Stage 5: TextEncoder ---
     ggml_cgraph* gf_te = kokoro_build_graph_text_enc(c, L);
-    if (!gf_te) return nullptr;
+    if (!gf_te) { std::free(align_idx); return nullptr; }
     ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf_te)) return nullptr;
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_te)) { std::free(align_idx); return nullptr; }
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf_te, "ids"), padded.data(), 0, (size_t)L * sizeof(int32_t));
-    if (ggml_backend_sched_graph_compute(c->sched, gf_te) != GGML_STATUS_SUCCESS) return nullptr;
+    if (ggml_backend_sched_graph_compute(c->sched, gf_te) != GGML_STATUS_SUCCESS) {
+        std::free(align_idx);
+        return nullptr;
+    }
     ggml_tensor* te_t = ggml_graph_get_tensor(gf_te, "text_enc_out");
     const size_t te_n = (size_t)te_t->ne[0] * (size_t)te_t->ne[1];
     std::vector<float> text_enc(te_n);
     ggml_backend_tensor_get(te_t, text_enc.data(), 0, te_n * sizeof(float));
 
-    // --- Stage 6: ASR alignment ---
-    int T_frames_asr = 0;
-    float* asr = kokoro_align_repeat(text_enc.data(), 512, L, dur_int.data(), &T_frames_asr);
-    if (!asr || T_frames_asr != T_frames) { std::free(asr); return nullptr; }
-
-    // --- Stage 7: Decoder body ---
-    ggml_cgraph* gf_dec = kokoro_build_graph_decoder_body(c, T_frames, n_raw);
-    if (!gf_dec) { std::free(asr); return nullptr; }
+    // --- Stage 6+7: Decoder body (gather text_enc on device with same indices) ---
+    ggml_cgraph* gf_dec = kokoro_build_graph_decoder_body(c, T_frames, L, n_raw);
+    if (!gf_dec) { std::free(align_idx); return nullptr; }
     ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf_dec)) { std::free(asr); return nullptr; }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "asr"), asr, 0, (size_t)512 * T_frames * sizeof(float));
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_dec)) { std::free(align_idx); return nullptr; }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "text_enc"), text_enc.data(), 0, te_n * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "align_idx"), align_idx, 0, (size_t)T_frames * sizeof(int32_t));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "f0"), f0_curve.data(), 0, fn_n * sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "n"), n_curve.data(), 0, fn_n * sizeof(float));
-    std::free(asr);
+    std::free(align_idx);
     if (ggml_backend_sched_graph_compute(c->sched, gf_dec) != GGML_STATUS_SUCCESS) return nullptr;
 
     ggml_tensor* dec_out = ggml_graph_get_tensor(gf_dec, "dec_decode_3_out");

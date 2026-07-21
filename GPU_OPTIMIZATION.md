@@ -43,34 +43,43 @@ host decision. The important properties are:
 
 ## Current pipeline
 
-The current implementation intentionally uses CPU-friendly stage boundaries:
+The current implementation still uses stage boundaries that are convenient for
+CPU debugging, but duration/text alignment no longer expands on the host:
 
 ```text
 1.  BERT graph
       download bert_proj
 2.  Duration predictor graph
       download duration encoding and duration values
-3.  CPU duration rounding and alignment
-      upload aligned duration encoding
+3.  CPU duration rounding
+      build int32 alignment indices of length T_frames
 4.  F0/noise graph
+      upload compact dur_enc (640,L) + indices; device ggml_get_rows → en
       download F0 and noise curves
 5.  Text encoder graph
       download text encoding
-6.  CPU text alignment
-      upload aligned text encoding
-7.  Decoder graph
+6.  Decoder graph
+      upload compact text_enc (512,L) + same indices; device gather → asr
       download decoder activation
-8.  CPU harmonic source generation
+7.  CPU harmonic source generation
       upload decoder activation and harmonics
-9.  Generator graph
+8.  Generator graph
       download magnitude and phase
-10. CPU iSTFT
+9.  CPU iSTFT
       return PCM
 ```
 
-This was reasonable for the original CPU-only implementation: a backend
+Host-side alignment used to materialise and upload `(640,T_frames)` and
+`(512,T_frames)` tensors. Those expansions are now device gathers, so the H2D
+payload for alignment is approximately `(640+512)·L` floats plus `2·T_frames`
+int32 indices instead of `(640+512)·T_frames` floats. The duration vector remains
+the legitimate host synchronisation point for dynamic `T_frames`. Scheduler
+resets between graphs still prevent keeping predictor/text-encoder allocations
+resident across stages.
+
+This structure was originally reasonable for CPU-only inference: a backend
 upload/download was generally a host-memory copy, and independent stages were
-easier to validate. On a discrete GPU, the same structure introduces repeated
+easier to validate. On a discrete GPU, the remaining round-trips still introduce
 PCIe transfers, scheduler resets, device synchronisation, and many small graph
 submissions.
 
@@ -146,21 +155,24 @@ clamps them, computes `T_frames`, and only then can build later dynamic-shape
 graphs. Reading this small duration vector is a legitimate synchronisation
 point.
 
-It does not require downloading the full duration encoding or text encoding.
-After the duration indices are known, alignment can become a device gather
-using a small host-generated index tensor.
+Alignment no longer downloads for the sake of host expansion: after the
+duration indices are known, F0/N and decoder graphs gather compact `dur_enc` /
+`text_enc` with a host-generated int32 index tensor via `ggml_get_rows`. The
+encodings are still downloaded today only because scheduler resets discard the
+producer allocations; keeping them device-resident across resets is a later
+step.
 
 ### 5. CPU custom stages force additional boundaries
 
 The following stages currently use ordinary C++ rather than GGML graphs:
 
-- duration/text alignment;
 - harmonic source and random-noise generation;
 - final iSTFT.
 
-The harmonic source upload and magnitude/phase download are therefore real
-boundaries today. Moving these stages must be done only after native-kernel
-parity tests exist.
+Duration/text alignment indices are still built on the host, but the feature
+expansion itself is a device gather. The harmonic source upload and
+magnitude/phase download remain real boundaries today. Moving the remaining
+CPU stages must be done only after native-kernel parity tests exist.
 
 ### 6. Scheduler fallback can hide data movement
 
@@ -360,6 +372,12 @@ These are end-to-end process times (model load, one synthesis, and WAV write),
 measured with four CPU threads on the hardware described above. They are not
 steady-state library benchmarks.
 
+After replacing host duration/text expansion with device `ggml_get_rows`
+gathers (same hardware, seed, and baseline text), one-run F16/Q8_0 validation
+reproduced the same correlations and relative RMS deltas (`0.953535` /
+`0.304508` and `0.690742` / `0.785317`). Quick-mode CPU PCM remained
+bit-identical to the prior cached golden.
+
 ### Phase B — stable intermediate-stage diagnostics
 
 Add a test-only observer or diagnostic executable that captures existing host
@@ -389,8 +407,10 @@ metric implementation as WAV comparison.
 
 - Keep BERT output device-resident into the predictor where shape permits.
 - Read only the small duration vector.
-- Build alignment index tensors on the host and execute alignment as device
-  gathers for duration and text encodings.
+- Done: build alignment index tensors on the host and execute alignment as
+  device gathers for duration and text encodings (`ggml_get_rows`).
+- Keep predictor/text-encoder outputs device-resident across scheduler resets
+  so compact encodings are not downloaded only to be re-uploaded.
 - Keep F0/noise tensors resident for the decoder while downloading only the F0
   data required by the current CPU harmonic generator.
 - Connect decoder output directly to the generator.

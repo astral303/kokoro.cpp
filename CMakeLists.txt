@@ -278,6 +278,18 @@ if(KOKORO_BUILD_TESTS)
     set_target_properties(test-c-api PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME c-api COMMAND test-c-api)
 
+    add_executable(test-align tests/test-align.cpp)
+    target_include_directories(test-align PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test-align PRIVATE -Wall -Wextra -Wpedantic)
+        if(KOKORO_WERROR)
+            target_compile_options(test-align PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME align COMMAND test-align)
+
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(
