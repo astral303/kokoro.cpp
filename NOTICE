@@ -8,13 +8,12 @@ Provenance
 
 The inference code in this project is derived from CrispASR
 (https://github.com/CrispStrobe/CrispASR), which implements the Kokoro
-TTS runtime among many other speech models. The extraction:
+TTS runtime among many other speech models. The extraction is based on
+CrispASR commit ef33e2e2ffb567528f082b142a7db69abee94ce0.
 
-  - Preserves all inference-critical math (forward pass graphs, GGUF
-    tensor naming, tokenizer, iSTFT, SineGen) to ensure bit-equivalent
-    output with the upstream CrispASR implementation.
-  - Removes GPU backends, multi-model orchestration, caching, and
-    non-Kokoro code paths.
+  - Preserves inference-critical math (forward pass graphs, GGUF tensor
+    naming, tokenizer, iSTFT, and SineGen).
+  - Removes GPU backends, multi-model orchestration, and non-Kokoro paths.
   - Renames symbols from CRISPASR_*/crispasr_* to KOKORO_*/kokoro_*.
   - Simplifies to require espeak-ng as a direct linked dependency.
 
@@ -46,12 +45,12 @@ espeak-ng (linked dependency)
     2. Complete corresponding source code must be made available.
     3. Users must receive a copy of the GPL license.
 
-  If you need a non-GPL distribution, you must either:
-    - Replace espeak-ng with a permissively-licensed phonemizer, or
-    - Use the kokoro_synthesize_phonemes() API which accepts pre-computed
-      IPA input and does not invoke espeak-ng.
+  A non-GPL build would need to remove this hard link and supply phonemes
+  through kokoro_synthesize_phonemes(), or replace espeak-ng with a
+  permissively licensed phonemizer. That is not a supported build mode in
+  this project today.
 
-  The kokoro library code itself (src/kokoro.cpp, src/phonemizer.cpp,
+  The kokoro library code itself (src/kokoro.cpp, src/phoneme_utils.h,
   include/kokoro.h, etc.) is MIT-licensed. Only the act of linking with
   espeak-ng creates GPL obligations on the combined binary.
 

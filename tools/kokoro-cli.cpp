@@ -7,17 +7,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
-static void write_wav(const char *path, const float *pcm, int n_samples,
+static bool write_wav(const char *path, const float *pcm, int n_samples,
                       int sample_rate) {
     FILE *f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "error: cannot open '%s' for writing\n", path);
-        return;
+        return false;
     }
 
     // Convert float to 16-bit PCM
-    int16_t *buf = (int16_t *)malloc(n_samples * sizeof(int16_t));
+    std::vector<int16_t> buf((size_t)n_samples);
     for (int i = 0; i < n_samples; i++) {
         float v = pcm[i];
         if (v > 1.0f) v = 1.0f;
@@ -59,10 +60,13 @@ static void write_wav(const char *path, const float *pcm, int n_samples,
     fwrite("data", 1, 4, f);
     u32 = (uint32_t)data_size;
     fwrite(&u32, 4, 1, f);
-    fwrite(buf, sizeof(int16_t), n_samples, f);
+    const bool ok = fwrite(buf.data(), sizeof(int16_t), (size_t)n_samples, f) == (size_t)n_samples;
 
-    fclose(f);
-    free(buf);
+    if (fclose(f) != 0 || !ok) {
+        fprintf(stderr, "error: failed writing '%s'\n", path);
+        return false;
+    }
+    return true;
 }
 
 static void usage(const char *prog) {
@@ -158,9 +162,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Write WAV (Kokoro always outputs 24 kHz)
-    int sr = 24000;
-    write_wav(output_path, pcm, n_samples, sr);
+    const int sr = kokoro_sample_rate(ctx);
+    if (sr <= 0 || !write_wav(output_path, pcm, n_samples, sr)) {
+        kokoro_pcm_free(pcm);
+        kokoro_free(ctx);
+        return 1;
+    }
     fprintf(stderr, "Wrote %d samples (%.2f s) to %s\n", n_samples,
             (float)n_samples / sr, output_path);
 

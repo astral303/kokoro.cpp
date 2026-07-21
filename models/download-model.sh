@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download Kokoro-82M GGUF model and default voice pack.
 # Models are hosted on Hugging Face.
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODEL_DIR="${KOKORO_MODEL_DIR:-$SCRIPT_DIR}"
@@ -20,9 +20,11 @@ download() {
     echo "Downloading: $url"
     echo "         to: $dest"
     if command -v curl &>/dev/null; then
-        curl -L --progress-bar -o "$dest" "$url"
+        curl --fail --location --progress-bar -o "$dest.part" "$url"
+        mv "$dest.part" "$dest"
     elif command -v wget &>/dev/null; then
-        wget -q --show-progress -O "$dest" "$url"
+        wget -q --show-progress -O "$dest.part" "$url"
+        mv "$dest.part" "$dest"
     else
         echo "Error: need curl or wget" >&2
         exit 1

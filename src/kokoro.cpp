@@ -22,13 +22,11 @@
 //                                                        ↓
 //   iSTFT on CPU (n_fft=20, hop=5, Hann) → 24 kHz audio
 //
-// This file is the M1 skeleton: GGUF two-pass load, hparams + vocab,
-// voice-pack secondary loader, scheduler setup, and stub C ABI for the
-// synth + stage extractors. Subsequent milestones fill in the forward
-// pass.
+// The implementation loads GGUF model and voice weights, phonemizes text,
+// executes each inference stage on ggml's CPU backend, and reconstructs PCM.
 
-#include "kokoro.h" // include/kokoro.h (public API)
-#include "phonemizer.h" // local stub
+#include "kokoro.h"
+#include "phoneme_utils.h"
 
 #include "core/activation.h"
 #include "core/align.h"
@@ -37,7 +35,6 @@
 #include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
-#include "core/gpu_backend_pref.h"
 #include "core/kokoro_env.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -64,11 +61,6 @@
 #include <espeak-ng/speak_lib.h>
 
 namespace {
-
-bool env_bool(const char* k) {
-    const char* v = kokoro_env::get(k);
-    return v && *v && std::strcmp(v, "0") != 0 && std::strcmp(v, "false") != 0;
-}
 
 // ===========================================================================
 // Bench instrumentation — `KOKORO_BENCH=1` for per-stage timings.
@@ -145,10 +137,8 @@ struct kokoro_voice_pack {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-// Bounded LRU for (lang \0 text) → IPA phonemes. The phonemizer (popen or
-// libespeak-ng) is the wall-clock floor for short inputs, so caching pays
-// for the diff harness, benchmarks, and any UI where the same text is
-// resynthesized after voice changes.
+// Bounded LRU for (lang \0 text) → IPA phonemes. Phonemization is the
+// wall-clock floor for short inputs, so caching repeated text pays off.
 struct kokoro_phoneme_cache {
     static constexpr size_t kMax = 1024;
     using value_t = std::pair<std::string, std::string>; // key, phonemes
@@ -199,10 +189,7 @@ struct kokoro_context {
     kokoro_hp hp;
     kokoro_vocab vocab;
 
-    // Backends. `backend` is the user's choice (Metal/CUDA/CPU); `backend_cpu`
-    // is always present. `gen_backend` is forced to CPU when
-    // gen_force_metal=false (the default — see header) to avoid a known
-    // Metal hang on stride-10 ConvTranspose1d in iSTFTNet's `gen.ups.0`.
+    // CPU backend used for weights and graph execution.
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
 
@@ -418,7 +405,7 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
         x = ggml_add(ctx0, x, fln_b);
     }
 
-    // Per-token last_hidden_state — exposed for diff-harness as the
+    // Per-token last_hidden_state — exposed as the
     // "bert_pooler_out" stage (legacy name; not actually pooled).
     ggml_tensor* seq = x; // (D, L)
     seq = ggml_cont(ctx0, seq);
@@ -439,19 +426,6 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     return gf;
 }
 
-// Wrap raw phoneme ids with the StyleTTS2 pad convention:
-//   wrapped = [pad_id, raw_ids..., pad_id]
-// The reference Python (KModel.forward) does this before feeding into
-// BERT / text_enc / predictor. The pad_id is the StyleTTS2 "$" token
-// (vocab index 0). All downstream stages see length L+2.
-static std::vector<int32_t> kokoro_pad_wrap_ids(const kokoro_context* c, const int32_t* raw, int n_raw) {
-    std::vector<int32_t> w;
-    w.reserve((size_t)n_raw + 2);
-    w.push_back(c->vocab.pad_id);
-    w.insert(w.end(), raw, raw + n_raw);
-    w.push_back(c->vocab.pad_id);
-    return w;
-}
 
 // ---------------------------------------------------------------------------
 // AdaLayerNorm (used by the predictor's DurationEncoder).
@@ -547,7 +521,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
     auto bias_1d = [&](ggml_tensor* b) { return ggml_reshape_3d(ctx0, b, 1, b->ne[0], 1); };
 
     for (int il = 0; il < 3; il++) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "text_enc.cnn.%d.conv.weight", il);
         ggml_tensor* cw = require(c, nm);
         std::snprintf(nm, sizeof(nm), "text_enc.cnn.%d.conv.bias", il);
@@ -595,117 +569,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
     return gf;
 }
 
-// Run text_enc and copy the named stage back to a malloc'd float buffer.
-// Pad-wraps the raw ids before computing.
-static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
-                                  int* out_n) {
-    kokoro_bench_stage _b("text_enc");
-    if (out_n)
-        *out_n = 0;
-    if (n_raw <= 0)
-        return nullptr;
-    std::vector<int32_t> padded = kokoro_pad_wrap_ids(c, raw_ids, n_raw);
-    const int L = (int)padded.size();
-    if (L > (int)c->hp.plbert_max_pos) {
-        fprintf(stderr, "kokoro: text_enc L_padded=%d exceeds max=%u\n", L, c->hp.plbert_max_pos);
-        return nullptr;
-    }
 
-    ggml_cgraph* gf = kokoro_build_graph_text_enc(c, L);
-    if (!gf)
-        return nullptr;
-
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        fprintf(stderr, "kokoro: sched_alloc_graph failed for text_enc\n");
-        return nullptr;
-    }
-
-    ggml_tensor* in_ids = ggml_graph_get_tensor(gf, "ids");
-    ggml_backend_tensor_set(in_ids, padded.data(), 0, (size_t)L * sizeof(int32_t));
-
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "kokoro: text_enc graph compute failed\n");
-        return nullptr;
-    }
-
-    ggml_tensor* out = ggml_graph_get_tensor(gf, stage_name);
-    if (!out) {
-        fprintf(stderr, "kokoro: text_enc graph missing output '%s'\n", stage_name);
-        return nullptr;
-    }
-
-    const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-    float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r)
-        return nullptr;
-    ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n)
-        *out_n = (int)n_floats;
-    return r;
-}
-
-// Run the BERT graph and copy the named stage tensor back to a malloc'd
-// float buffer. Returns nullptr on failure. *out_n is set to the total
-// number of float elements (D × L_padded) on success. The input `ids`
-// are RAW phoneme ids; this function adds the StyleTTS2 pad-wrap before
-// computing, so the output corresponds to L+2 tokens.
-static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
-                              int* out_n) {
-    kokoro_bench_stage _b("bert");
-    if (out_n)
-        *out_n = 0;
-    if (n_raw <= 0) {
-        fprintf(stderr, "kokoro: bert needs L > 0 (got %d)\n", n_raw);
-        return nullptr;
-    }
-    std::vector<int32_t> padded = kokoro_pad_wrap_ids(c, raw_ids, n_raw);
-    const int L = (int)padded.size();
-    if (L > (int)c->hp.plbert_max_pos) {
-        fprintf(stderr, "kokoro: bert L_padded=%d exceeds max_position_embeddings=%u\n", L, c->hp.plbert_max_pos);
-        return nullptr;
-    }
-
-    ggml_cgraph* gf = kokoro_build_graph_bert(c, L);
-    if (!gf)
-        return nullptr;
-
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        fprintf(stderr, "kokoro: sched_alloc_graph failed for bert\n");
-        return nullptr;
-    }
-
-    // Fill inputs.
-    ggml_tensor* in_ids = ggml_graph_get_tensor(gf, "ids");
-    ggml_tensor* in_pos = ggml_graph_get_tensor(gf, "positions");
-    ggml_backend_tensor_set(in_ids, padded.data(), 0, (size_t)L * sizeof(int32_t));
-
-    std::vector<int32_t> positions(L);
-    for (int i = 0; i < L; i++)
-        positions[i] = i;
-    ggml_backend_tensor_set(in_pos, positions.data(), 0, (size_t)L * sizeof(int32_t));
-
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "kokoro: bert graph compute failed\n");
-        return nullptr;
-    }
-
-    ggml_tensor* out = ggml_graph_get_tensor(gf, stage_name);
-    if (!out) {
-        fprintf(stderr, "kokoro: bert graph missing output '%s'\n", stage_name);
-        return nullptr;
-    }
-
-    const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-    float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r)
-        return nullptr;
-    ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n)
-        *out_n = (int)n_floats;
-    return r;
-}
 
 // ---------------------------------------------------------------------------
 // M6 — Alignment (CPU)
@@ -768,21 +632,21 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
     // See tests/test_metal_norm_repro.cpp for a standalone repro.
     ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x));
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_pre_norm_TC", dbg_prefix);
         ggml_set_name(xt, nm);
         ggml_set_output(xt);
     }
     xt = ggml_norm(ctx, xt, kAdaIn1dEps);
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_post_norm_TC", dbg_prefix);
         ggml_set_name(xt, nm);
         ggml_set_output(xt);
     }
     ggml_tensor* normed = ggml_cont(ctx, ggml_transpose(ctx, xt)); // (C, T)
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_normed", dbg_prefix);
         ggml_set_name(normed, nm);
         ggml_set_output(normed);
@@ -792,7 +656,7 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
     ggml_tensor* h = ggml_mul_mat(ctx, fc_w, style);
     h = ggml_add(ctx, h, fc_b);
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_h", dbg_prefix);
         ggml_set_name(h, nm);
         ggml_set_output(h);
@@ -804,21 +668,21 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
     // (1 + γ) * normed + β  →  normed + normed*γ + β  (saves the "1" tensor).
     ggml_tensor* x_gamma = ggml_mul(ctx, normed, gamma);
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_xgamma", dbg_prefix);
         ggml_set_name(x_gamma, nm);
         ggml_set_output(x_gamma);
     }
     ggml_tensor* out = ggml_add(ctx, normed, x_gamma);
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_normed_plus_xgamma", dbg_prefix);
         ggml_set_name(out, nm);
         ggml_set_output(out);
     }
     out = ggml_add(ctx, out, beta);
     if (dbg_prefix) {
-        char nm[64];
+        char nm[128];
         std::snprintf(nm, sizeof(nm), "%s_out", dbg_prefix);
         ggml_set_name(out, nm);
         ggml_set_output(out);
@@ -830,7 +694,7 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
 // every Kokoro AdainResBlk1d with `upsample=True` (predictor F0[1] /
 // N[1] and decoder.decode[3]). See core_convt::convt1d_depthwise_2x_k3
 // for the (k=3, s=2, p=1, op=1) derivation, including the wrong-end
-// trap that the M11 diff harness caught.
+// trap caught during validation.
 static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w_kernel,
                                                     ggml_tensor* w_bias) {
     return core_convt::convt1d_depthwise_2x_k3(ctx, x, w_kernel, w_bias);
@@ -874,7 +738,7 @@ static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x
     (void)dim_in;
 
     // ---- Residual path ----
-    char nm[64];
+    char nm[128];
     auto tag = [&](ggml_tensor* t, const char* suffix) {
         if (!dbg_prefix)
             return;
@@ -1120,107 +984,6 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     return gf;
 }
 
-// Run the predictor graph and return the named stage as malloc'd float[].
-// Stage handling:
-//   "dur_enc_out"  → (640, L) raw output
-//   "durations"    → (L,) post-round, post-clamp(min=1), cast to float
-static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
-                                   int* out_n) {
-    kokoro_bench_stage _b("predictor");
-    if (out_n)
-        *out_n = 0;
-    if (!c->vp_loaded) {
-        fprintf(stderr, "kokoro: predictor needs voice pack — call kokoro_load_voice_pack first\n");
-        return nullptr;
-    }
-    if (n_raw <= 0)
-        return nullptr;
-
-    // 1. Run BERT to get bert_proj_out.
-    int n_bp = 0;
-    float* bp = kokoro_run_bert(c, raw_ids, n_raw, "bert_proj_out", &n_bp);
-    if (!bp)
-        return nullptr;
-    const int D = (int)c->hp.hidden_dim;
-    const int L = n_bp / D;
-    if (L * D != n_bp) {
-        fprintf(stderr, "kokoro: bert_proj_out size mismatch: %d not divisible by %d\n", n_bp, D);
-        std::free(bp);
-        return nullptr;
-    }
-
-    // 2. Build + run predictor graph.
-    ggml_cgraph* gf = kokoro_build_graph_predictor(c, L, n_raw);
-    if (!gf) {
-        std::free(bp);
-        return nullptr;
-    }
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        fprintf(stderr, "kokoro: sched_alloc_graph failed for predictor\n");
-        std::free(bp);
-        return nullptr;
-    }
-    ggml_tensor* in_bd = ggml_graph_get_tensor(gf, "bert_dur");
-    ggml_backend_tensor_set(in_bd, bp, 0, (size_t)n_bp * sizeof(float));
-    std::free(bp);
-
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "kokoro: predictor graph compute failed\n");
-        return nullptr;
-    }
-
-    if (std::strcmp(stage_name, "dur_enc_out") == 0) {
-        ggml_tensor* out = ggml_graph_get_tensor(gf, "dur_enc_out");
-        const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-        float* r = (float*)std::malloc(n_floats * sizeof(float));
-        if (!r)
-            return nullptr;
-        ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-        if (out_n)
-            *out_n = (int)n_floats;
-        return r;
-    }
-    if (std::strcmp(stage_name, "durations") == 0) {
-        ggml_tensor* out = ggml_graph_get_tensor(gf, "durations_pre");
-        // out ne = (1, L) F32
-        std::vector<float> raw_dur((size_t)L);
-        ggml_backend_tensor_get(out, raw_dur.data(), 0, (size_t)L * sizeof(float));
-        // Banker's rounding to match PyTorch's torch.round (R5).
-        // fesetround(FE_TONEAREST) is already set globally for nearbyintf
-        // to use round-half-to-even; we set it once at process init below.
-        // PLAN #88: per-phoneme length_scale is applied BEFORE the
-        // round so the round-half-to-even semantics are preserved
-        // (>1.0 stretches the audio; <1.0 squeezes). 1.0 = upstream
-        // default = no-op.
-        const float length_scale = c->params.length_scale > 0.0f ? c->params.length_scale : 1.0f;
-        float* r = (float*)std::malloc((size_t)L * sizeof(float));
-        if (!r)
-            return nullptr;
-        for (int i = 0; i < L; i++) {
-            float v = std::nearbyintf(raw_dur[i] * length_scale);
-            if (v < 1.0f)
-                v = 1.0f;
-            r[i] = v;
-        }
-        if (out_n)
-            *out_n = L;
-        return r;
-    }
-    if (std::strcmp(stage_name, "pred_lstm_out") == 0) {
-        ggml_tensor* out = ggml_graph_get_tensor(gf, "pred_lstm_out");
-        const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-        float* r = (float*)std::malloc(n_floats * sizeof(float));
-        if (!r)
-            return nullptr;
-        ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-        if (out_n)
-            *out_n = (int)n_floats;
-        return r;
-    }
-    fprintf(stderr, "kokoro: unknown predictor stage '%s'\n", stage_name);
-    return nullptr;
-}
 
 // ---------------------------------------------------------------------------
 // M5b — F0Ntrain (pred.shared LSTM + F0/N AdainResBlk1d × 3 + F0/N_proj)
@@ -1274,10 +1037,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     ggml_tensor* shared_out = core_lstm::lstm_bidir(ctx0, gf, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f, sh_W_ih_r,
                                                     sh_W_hh_r, sh_b_ih_r, sh_b_hh_r,
                                                     H_lstm); // (512, T_frames)
-    // Tag the shared LSTM output so kokoro_extract_stage can surface it
-    // via "pred_shared_out". Used to bisect Metal-specific kokoro
-    // regressions inside F0Ntrain (the LSTM is between pred_lstm_out and
-    // f0_curve in the per-stage diff cascade).
+    // Named output for diagnostics.
     ggml_set_name(shared_out, "pred_shared_out");
     ggml_set_output(shared_out);
     ggml_build_forward_expand(gf, shared_out);
@@ -1331,7 +1091,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     // KOKORO_DEBUG_INTERMEDIATES=1, every sub-op output inside the
     // first block (AdaIN1d → LeakyReLU → Conv1d → AdaIN1d → LeakyReLU
     // → Conv1d → residual) is named "dbg_pred_{f0,n}_0_…" and marked
-    // as a graph output so KOKORO_DUMP_STAGES (see diff harness) can
+    // as a graph output so diagnostic stage dumps can
     // write each one to disk for GPU-vs-CPU comparison. Unset (the
     // default) and the block runs with no extra ops or outputs, so
     // production builds pay zero cost. Used to bisect the ggml_norm
@@ -1355,7 +1115,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
         y = kokoro_adain_resblk(ctx0, y, style_pred, w0.a1w, w0.a1b, w0.a2w, w0.a2b, w0.c1w, w0.c1b, w0.c2w, w0.c2b,
                                 /*pool*/ nullptr, nullptr, /*conv1x1*/ nullptr, dbg0);
         // Tag each AdainResBlk1d output as `pred_{f0,n}_{k}_out` so
-        // diff harness can compare them against the Python reference
+        // diagnostic dumps can compare against reference
         // and pinpoint the first stage that diverges on Metal.
         {
             char nm[32];
@@ -1427,99 +1187,6 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     return gf;
 }
 
-// Run the full predictor + alignment + F0Ntrain pipeline. Returns the named
-// stage as malloc'd float[]. Stages handled:
-//   "align_out" → (640, T_frames)
-//   "f0_curve"  → (2*T_frames,)   (already squeezed from (1, 2*T_frames))
-//   "n_curve"   → (2*T_frames,)
-static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name, int* out_n) {
-    kokoro_bench_stage _b("f0n");
-    if (out_n)
-        *out_n = 0;
-    if (!c->vp_loaded) {
-        fprintf(stderr, "kokoro: F0Ntrain needs voice pack\n");
-        return nullptr;
-    }
-    // 1. Run predictor → dur_enc_out + durations.
-    int n_de = 0, n_dr = 0;
-    float* de = kokoro_run_predictor(c, raw_ids, n_raw, "dur_enc_out", &n_de);
-    if (!de)
-        return nullptr;
-    float* dr = kokoro_run_predictor(c, raw_ids, n_raw, "durations", &n_dr);
-    if (!dr) {
-        std::free(de);
-        return nullptr;
-    }
-
-    const int D = 640;
-    const int L = n_dr;
-    if (n_de != D * L) {
-        fprintf(stderr, "kokoro: dur_enc/durations length mismatch %d vs %d*%d\n", n_de, D, L);
-        std::free(de);
-        std::free(dr);
-        return nullptr;
-    }
-
-    // 2. CPU alignment (M6).
-    std::vector<int> dur_int((size_t)L);
-    for (int i = 0; i < L; i++)
-        dur_int[i] = (int)dr[i];
-    std::free(dr);
-    int T_frames = 0;
-    float* en = kokoro_align_repeat(de, D, L, dur_int.data(), &T_frames);
-    std::free(de);
-    if (!en || T_frames <= 0) {
-        std::free(en);
-        return nullptr;
-    }
-
-    if (std::strcmp(stage_name, "align_out") == 0) {
-        if (out_n)
-            *out_n = D * T_frames;
-        return en;
-    }
-
-    // 3. Run F0/N graph.
-    ggml_cgraph* gf = kokoro_build_graph_f0n(c, T_frames, n_raw);
-    if (!gf) {
-        std::free(en);
-        return nullptr;
-    }
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        fprintf(stderr, "kokoro: sched_alloc_graph failed for F0Ntrain\n");
-        std::free(en);
-        return nullptr;
-    }
-    ggml_tensor* in_en = ggml_graph_get_tensor(gf, "en");
-    ggml_backend_tensor_set(in_en, en, 0, (size_t)D * T_frames * sizeof(float));
-    std::free(en);
-
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "kokoro: F0Ntrain graph compute failed\n");
-        return nullptr;
-    }
-
-    const char* tname = stage_name; // "f0_curve" or "n_curve" — names match graph
-    ggml_tensor* out = ggml_graph_get_tensor(gf, tname);
-    if (!out) {
-        // dbg_* stages are opt-in (KOKORO_DEBUG_INTERMEDIATES=1); when
-        // that's unset they're never tagged into the graph. Silently
-        // return null so diff harness can route them to SKIP rather
-        // than flooding stderr in normal runs.
-        if (std::strncmp(tname, "dbg_", 4) != 0)
-            fprintf(stderr, "kokoro: F0Ntrain graph missing output '%s'\n", tname);
-        return nullptr;
-    }
-    const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-    float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r)
-        return nullptr;
-    ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n)
-        *out_n = (int)n_floats;
-    return r;
-}
 
 // ---------------------------------------------------------------------------
 // M7a/M7b — Decoder body (F0_conv + N_conv + asr_res + encode + 4× decode)
@@ -1675,117 +1342,6 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
     return gf;
 }
 
-// Run the full preamble (BERT, predictor, alignment, F0Ntrain, text_enc) +
-// decoder body, returning the named stage as malloc'd float[].
-static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
-                                      int* out_n) {
-    kokoro_bench_stage _b("decoder_body");
-    if (out_n)
-        *out_n = 0;
-    if (!c->vp_loaded) {
-        fprintf(stderr, "kokoro: decoder needs voice pack\n");
-        return nullptr;
-    }
-
-    // 1. dur_enc_out + durations from predictor.
-    int n_de = 0, n_dr = 0;
-    float* de = kokoro_run_predictor(c, raw_ids, n_raw, "dur_enc_out", &n_de);
-    if (!de)
-        return nullptr;
-    float* dr = kokoro_run_predictor(c, raw_ids, n_raw, "durations", &n_dr);
-    if (!dr) {
-        std::free(de);
-        return nullptr;
-    }
-    const int L = n_dr;
-    std::vector<int> dur_int((size_t)L);
-    for (int i = 0; i < L; i++)
-        dur_int[i] = (int)dr[i];
-    std::free(dr);
-    int T_frames = 0;
-    float* en = kokoro_align_repeat(de, 640, L, dur_int.data(), &T_frames);
-    std::free(de);
-    if (!en)
-        return nullptr;
-
-    // 2. F0/N curves from F0Ntrain (uses en internally — recompute here for simplicity).
-    int n_f = 0, n_nc = 0;
-    float* f0 = kokoro_run_f0n(c, raw_ids, n_raw, "f0_curve", &n_f);
-    if (!f0) {
-        std::free(en);
-        return nullptr;
-    }
-    float* nc = kokoro_run_f0n(c, raw_ids, n_raw, "n_curve", &n_nc);
-    if (!nc) {
-        std::free(en);
-        std::free(f0);
-        return nullptr;
-    }
-
-    // 3. text_enc_out, then duration-align to asr.
-    int n_te = 0;
-    float* te = kokoro_run_text_enc(c, raw_ids, n_raw, "text_enc_out", &n_te);
-    if (!te) {
-        std::free(en);
-        std::free(f0);
-        std::free(nc);
-        return nullptr;
-    }
-    int T_frames_asr = 0;
-    float* asr = kokoro_align_repeat(te, 512, L, dur_int.data(), &T_frames_asr);
-    std::free(te);
-    if (!asr || T_frames_asr != T_frames) {
-        fprintf(stderr, "kokoro: T_frames mismatch (%d != %d)\n", T_frames_asr, T_frames);
-        std::free(asr);
-        std::free(en);
-        std::free(f0);
-        std::free(nc);
-        return nullptr;
-    }
-    std::free(en); // not directly used by decoder body — F0Ntrain consumed it already
-
-    // 4. Build + run decoder-body graph.
-    ggml_cgraph* gf = kokoro_build_graph_decoder_body(c, T_frames, n_raw);
-    if (!gf) {
-        std::free(asr);
-        std::free(f0);
-        std::free(nc);
-        return nullptr;
-    }
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        fprintf(stderr, "kokoro: sched_alloc_graph failed for decoder body\n");
-        std::free(asr);
-        std::free(f0);
-        std::free(nc);
-        return nullptr;
-    }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "asr"), asr, 0, (size_t)512 * T_frames * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "f0"), f0, 0, (size_t)2 * T_frames * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "n"), nc, 0, (size_t)2 * T_frames * sizeof(float));
-    std::free(asr);
-    std::free(f0);
-    std::free(nc);
-
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "kokoro: decoder-body graph compute failed\n");
-        return nullptr;
-    }
-
-    ggml_tensor* out = ggml_graph_get_tensor(gf, stage_name);
-    if (!out) {
-        fprintf(stderr, "kokoro: decoder-body graph missing output '%s'\n", stage_name);
-        return nullptr;
-    }
-    const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-    float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r)
-        return nullptr;
-    ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n)
-        *out_n = (int)n_floats;
-    return r;
-}
 
 // ---------------------------------------------------------------------------
 // M7c — Generator (iSTFTNet)
@@ -2295,109 +1851,6 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
     return gf;
 }
 
-// Run the full pre-generator chain (predictor → align → F0Ntrain → decoder
-// body) plus the generator graph itself, and return the named stage as
-// malloc'd float[]. Stages handled:
-//   "gen_pre_post_out" → (128, T_har)
-//   "mag"              → (11, T_har)
-//   "phase"            → (11, T_har)
-//
-// rng is seeded from KOKORO_SEED env (default 0x12345) so the SineGen noise
-// is reproducible run-to-run; the diff-harness M11 dumper should set the
-// same seed on the Python side.
-static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
-                                   int* out_n) {
-    kokoro_bench_stage _b("generator");
-    if (out_n)
-        *out_n = 0;
-    if (!c->vp_loaded) {
-        fprintf(stderr, "kokoro: generator needs voice pack\n");
-        return nullptr;
-    }
-
-    // 1. dec_decode_3_out — runs predictor + align + F0Ntrain + decoder body.
-    int n_x = 0;
-    float* x_in = kokoro_run_decoder_body(c, raw_ids, n_raw, "dec_decode_3_out", &n_x);
-    if (!x_in)
-        return nullptr;
-    const int two_T = n_x / 512;
-    if (two_T * 512 != n_x) {
-        fprintf(stderr, "kokoro: dec_decode_3_out size %d not divisible by 512\n", n_x);
-        std::free(x_in);
-        return nullptr;
-    }
-    const int T_frames = two_T / 2;
-    if (T_frames <= 0) {
-        fprintf(stderr, "kokoro: T_frames=%d invalid\n", T_frames);
-        std::free(x_in);
-        return nullptr;
-    }
-
-    // 2. f0_curve — used by SineGen to build `har`.
-    int n_f0 = 0;
-    float* f0 = kokoro_run_f0n(c, raw_ids, n_raw, "f0_curve", &n_f0);
-    if (!f0) {
-        std::free(x_in);
-        return nullptr;
-    }
-    if (n_f0 != 2 * T_frames) {
-        fprintf(stderr, "kokoro: f0_curve length %d != 2*T_frames=%d\n", n_f0, 2 * T_frames);
-        std::free(x_in);
-        std::free(f0);
-        return nullptr;
-    }
-
-    // 3. Build `har` (22, T_har) on CPU.
-    const char* seed_env = kokoro_env::get("KOKORO_SEED");
-    uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
-    std::mt19937 rng(seed);
-    int T_har = 0;
-    float* har = kokoro_make_har(c, f0, T_frames, &T_har, rng);
-    std::free(f0);
-    if (!har) {
-        std::free(x_in);
-        return nullptr;
-    }
-
-    // 4. Build + run the generator graph on gen_sched (multi-backend, with
-    //    conv_transpose_1d pinned to CPU unless gen_force_metal=true).
-    ggml_cgraph* gf = kokoro_build_graph_generator(c, T_frames, T_har, n_raw);
-    if (!gf) {
-        std::free(x_in);
-        std::free(har);
-        return nullptr;
-    }
-    ggml_backend_sched_reset(c->sched);
-    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
-        fprintf(stderr, "kokoro: sched_alloc_graph failed for generator\n");
-        std::free(x_in);
-        std::free(har);
-        return nullptr;
-    }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_in, 0, (size_t)512 * 2 * T_frames * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "har"), har, 0, (size_t)22 * T_har * sizeof(float));
-    std::free(x_in);
-    std::free(har);
-
-    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "kokoro: generator graph compute failed\n");
-        return nullptr;
-    }
-
-    ggml_tensor* out = ggml_graph_get_tensor(gf, stage_name);
-    if (!out) {
-        fprintf(stderr, "kokoro: generator graph missing output '%s'\n", stage_name);
-        return nullptr;
-    }
-    const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
-    float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r)
-        return nullptr;
-    ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n)
-        *out_n = (int)n_floats;
-    return r;
-}
 
 // ---------------------------------------------------------------------------
 // M8 — iSTFT (CPU)
@@ -2498,36 +1951,158 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
     return out;
 }
 
-// Stage extractor entry for the iSTFT'd audio. Runs the full chain
-// (preamble → decoder body → generator → iSTFT) and returns the audio buffer.
-static float* kokoro_run_audio(kokoro_context* c, const int32_t* raw_ids, int n_raw, int* out_n) {
-    if (out_n)
-        *out_n = 0;
-    int n_mag = 0;
-    float* mag = kokoro_run_generator(c, raw_ids, n_raw, "mag", &n_mag);
-    if (!mag)
-        return nullptr;
-    int n_phase = 0;
-    float* phase = kokoro_run_generator(c, raw_ids, n_raw, "phase", &n_phase);
-    if (!phase) {
-        std::free(mag);
+
+// ---------------------------------------------------------------------------
+// Unified synthesis pipeline — runs each graph at most once per call.
+//
+// The selector-style kokoro_run_* helpers above rerun earlier stages for
+// each output they need. For production synthesis, this pipeline executes
+// each expensive graph exactly once and passes intermediates forward.
+// ---------------------------------------------------------------------------
+
+static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_ids, int n_raw, int* out_n) {
+    if (out_n) *out_n = 0;
+    if (!c->vp_loaded || n_raw <= 0) return nullptr;
+
+    // --- Stage 1: BERT ---
+    std::vector<int32_t> padded;
+    padded.reserve((size_t)n_raw + 2);
+    padded.push_back(c->vocab.pad_id);
+    padded.insert(padded.end(), raw_ids, raw_ids + n_raw);
+    padded.push_back(c->vocab.pad_id);
+    const int L = (int)padded.size();
+    if (L > (int)c->hp.plbert_max_pos) {
+        fprintf(stderr, "kokoro: L_padded=%d exceeds max=%u\n", L, c->hp.plbert_max_pos);
         return nullptr;
     }
-    if (n_mag != n_phase || n_mag % 11 != 0) {
-        fprintf(stderr, "kokoro: mag/phase length mismatch %d vs %d\n", n_mag, n_phase);
-        std::free(mag);
-        std::free(phase);
-        return nullptr;
+
+    ggml_cgraph* gf_bert = kokoro_build_graph_bert(c, L);
+    if (!gf_bert) return nullptr;
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_bert)) return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_bert, "ids"), padded.data(), 0, (size_t)L * sizeof(int32_t));
+    std::vector<int32_t> positions(L);
+    for (int i = 0; i < L; i++) positions[i] = i;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_bert, "positions"), positions.data(), 0, (size_t)L * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(c->sched, gf_bert) != GGML_STATUS_SUCCESS) return nullptr;
+
+    ggml_tensor* bp_t = ggml_graph_get_tensor(gf_bert, "bert_proj_out");
+    const size_t bp_n = (size_t)bp_t->ne[0] * (size_t)bp_t->ne[1];
+    std::vector<float> bert_proj(bp_n);
+    ggml_backend_tensor_get(bp_t, bert_proj.data(), 0, bp_n * sizeof(float));
+
+    // --- Stage 2: Predictor (produces dur_enc_out + durations) ---
+    ggml_cgraph* gf_pred = kokoro_build_graph_predictor(c, L, n_raw);
+    if (!gf_pred) return nullptr;
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_pred)) return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_pred, "bert_dur"), bert_proj.data(), 0, bp_n * sizeof(float));
+    if (ggml_backend_sched_graph_compute(c->sched, gf_pred) != GGML_STATUS_SUCCESS) return nullptr;
+
+    // Extract dur_enc_out (640, L)
+    ggml_tensor* de_t = ggml_graph_get_tensor(gf_pred, "dur_enc_out");
+    const size_t de_n = (size_t)de_t->ne[0] * (size_t)de_t->ne[1];
+    std::vector<float> dur_enc(de_n);
+    ggml_backend_tensor_get(de_t, dur_enc.data(), 0, de_n * sizeof(float));
+
+    // Extract durations (1, L) → round + clamp
+    ggml_tensor* dp_t = ggml_graph_get_tensor(gf_pred, "durations_pre");
+    std::vector<float> dur_raw((size_t)L);
+    ggml_backend_tensor_get(dp_t, dur_raw.data(), 0, (size_t)L * sizeof(float));
+    const float length_scale = c->params.length_scale > 0.0f ? c->params.length_scale : 1.0f;
+    std::vector<int> dur_int((size_t)L);
+    for (int i = 0; i < L; i++) {
+        float v = std::nearbyintf(dur_raw[i] * length_scale);
+        if (v < 1.0f) v = 1.0f;
+        dur_int[i] = (int)v;
     }
-    const int T_har = n_mag / 11;
+
+    // --- Stage 3: Alignment (CPU) ---
+    int T_frames = 0;
+    float* en = kokoro_align_repeat(dur_enc.data(), 640, L, dur_int.data(), &T_frames);
+    if (!en || T_frames <= 0) { std::free(en); return nullptr; }
+
+    // --- Stage 4: F0/N prediction (produces f0_curve + n_curve in one graph) ---
+    ggml_cgraph* gf_f0n = kokoro_build_graph_f0n(c, T_frames, n_raw);
+    if (!gf_f0n) { std::free(en); return nullptr; }
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_f0n)) { std::free(en); return nullptr; }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_f0n, "en"), en, 0, (size_t)640 * T_frames * sizeof(float));
+    std::free(en);
+    if (ggml_backend_sched_graph_compute(c->sched, gf_f0n) != GGML_STATUS_SUCCESS) return nullptr;
+
+    // Extract both f0 and n curves
+    ggml_tensor* f0_t = ggml_graph_get_tensor(gf_f0n, "f0_curve");
+    ggml_tensor* n_t = ggml_graph_get_tensor(gf_f0n, "n_curve");
+    const size_t fn_n = (size_t)f0_t->ne[0] * (size_t)f0_t->ne[1]; // 2*T_frames
+    std::vector<float> f0_curve(fn_n), n_curve(fn_n);
+    ggml_backend_tensor_get(f0_t, f0_curve.data(), 0, fn_n * sizeof(float));
+    ggml_backend_tensor_get(n_t, n_curve.data(), 0, fn_n * sizeof(float));
+
+    // --- Stage 5: TextEncoder ---
+    ggml_cgraph* gf_te = kokoro_build_graph_text_enc(c, L);
+    if (!gf_te) return nullptr;
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_te)) return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_te, "ids"), padded.data(), 0, (size_t)L * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(c->sched, gf_te) != GGML_STATUS_SUCCESS) return nullptr;
+    ggml_tensor* te_t = ggml_graph_get_tensor(gf_te, "text_enc_out");
+    const size_t te_n = (size_t)te_t->ne[0] * (size_t)te_t->ne[1];
+    std::vector<float> text_enc(te_n);
+    ggml_backend_tensor_get(te_t, text_enc.data(), 0, te_n * sizeof(float));
+
+    // --- Stage 6: ASR alignment ---
+    int T_frames_asr = 0;
+    float* asr = kokoro_align_repeat(text_enc.data(), 512, L, dur_int.data(), &T_frames_asr);
+    if (!asr || T_frames_asr != T_frames) { std::free(asr); return nullptr; }
+
+    // --- Stage 7: Decoder body ---
+    ggml_cgraph* gf_dec = kokoro_build_graph_decoder_body(c, T_frames, n_raw);
+    if (!gf_dec) { std::free(asr); return nullptr; }
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_dec)) { std::free(asr); return nullptr; }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "asr"), asr, 0, (size_t)512 * T_frames * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "f0"), f0_curve.data(), 0, fn_n * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_dec, "n"), n_curve.data(), 0, fn_n * sizeof(float));
+    std::free(asr);
+    if (ggml_backend_sched_graph_compute(c->sched, gf_dec) != GGML_STATUS_SUCCESS) return nullptr;
+
+    ggml_tensor* dec_out = ggml_graph_get_tensor(gf_dec, "dec_decode_3_out");
+    const size_t dec_n = (size_t)dec_out->ne[0] * (size_t)dec_out->ne[1];
+    std::vector<float> dec_decode(dec_n);
+    ggml_backend_tensor_get(dec_out, dec_decode.data(), 0, dec_n * sizeof(float));
+
+    // --- Stage 8: HnNSF (CPU-side har generation) ---
+    const char* seed_env = kokoro_env::get("KOKORO_SEED");
+    uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
+    std::mt19937 rng(seed);
+    int T_har = 0;
+    float* har = kokoro_make_har(c, f0_curve.data(), T_frames, &T_har, rng);
+    if (!har) return nullptr;
+
+    // --- Stage 9: Generator (produces mag + phase in one graph) ---
+    ggml_cgraph* gf_gen = kokoro_build_graph_generator(c, T_frames, T_har, n_raw);
+    if (!gf_gen) { std::free(har); return nullptr; }
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf_gen)) { std::free(har); return nullptr; }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_gen, "x_in"), dec_decode.data(), 0, dec_n * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_gen, "har"), har, 0, (size_t)22 * T_har * sizeof(float));
+    std::free(har);
+    if (ggml_backend_sched_graph_compute(c->sched, gf_gen) != GGML_STATUS_SUCCESS) return nullptr;
+
+    // Extract both mag and phase from one generator execution
+    ggml_tensor* mag_t = ggml_graph_get_tensor(gf_gen, "mag");
+    ggml_tensor* phase_t = ggml_graph_get_tensor(gf_gen, "phase");
+    const size_t mp_n = (size_t)mag_t->ne[0] * (size_t)mag_t->ne[1]; // 11 * T_har
+    std::vector<float> mag(mp_n), phase(mp_n);
+    ggml_backend_tensor_get(mag_t, mag.data(), 0, mp_n * sizeof(float));
+    ggml_backend_tensor_get(phase_t, phase.data(), 0, mp_n * sizeof(float));
+
+    // --- Stage 10: iSTFT (CPU) ---
     int T_audio = 0;
-    float* audio = kokoro_run_istft(mag, phase, T_har, &T_audio);
-    std::free(mag);
-    std::free(phase);
-    if (!audio)
-        return nullptr;
-    if (out_n)
-        *out_n = T_audio;
+    float* audio = kokoro_run_istft(mag.data(), phase.data(), T_har, &T_audio);
+    if (!audio) return nullptr;
+    if (out_n) *out_n = T_audio;
     return audio;
 }
 
@@ -2805,8 +2380,9 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
         return -1;
     }
 
+    ggml_tensor* pack_ptr = it->second; // save before move invalidates iterator
     ctx->vp.tensors = std::move(wl.tensors);
-    ctx->vp.pack = it->second;
+    ctx->vp.pack = pack_ptr;
     ctx->vp.vp_ctx_w = wl.ctx;
     ctx->vp.vp_buf_w = wl.buf;
     ctx->vp_loaded = true;
@@ -2924,7 +2500,7 @@ extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const c
         return nullptr;
     }
     int n_audio = 0;
-    float* audio = kokoro_run_audio(ctx, ids, n_ids, &n_audio);
+    float* audio = kokoro_synthesize_pipeline(ctx, ids, n_ids, &n_audio);
     std::free(ids);
     if (!audio || n_audio <= 0)
         return nullptr;
@@ -2953,8 +2529,7 @@ bool g_espeak_init_failed = false; // sticky — don't keep retrying
 std::string g_espeak_voice;
 
 
-// Returns true on success and fills `out`. Returns false to signal "fall
-// back to popen" (init failed, voice switch failed, or no output).
+// Returns true on success and fills `out`.
 bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std::string& out) {
     std::lock_guard<std::mutex> g(g_espeak_mu);
     if (g_espeak_init_failed)
@@ -2964,7 +2539,7 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
         int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, path,
                                    espeakINITIALIZE_PHONEME_IPA | espeakINITIALIZE_DONT_EXIT);
         if (sr < 0) {
-            fprintf(stderr, "kokoro: espeak_Initialize failed (data path=%s) — falling back to popen\n",
+            fprintf(stderr, "kokoro: espeak_Initialize failed (data path=%s)\n",
                     path ? path : "<default>");
             g_espeak_init_failed = true;
             return false;
@@ -2973,7 +2548,7 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
     }
     if (g_espeak_voice != lang) {
         if (espeak_SetVoiceByName(lang.c_str()) != EE_OK) {
-            fprintf(stderr, "kokoro: espeak_SetVoiceByName('%s') failed — falling back to popen\n", lang.c_str());
+            fprintf(stderr, "kokoro: espeak_SetVoiceByName('%s') failed\n", lang.c_str());
             return false;
         }
         g_espeak_voice = lang;
@@ -3104,6 +2679,10 @@ extern "C" void kokoro_pcm_free(float* pcm) {
     std::free(pcm);
 }
 
+extern "C" int kokoro_sample_rate(const struct kokoro_context* ctx) {
+    return ctx ? (int)ctx->hp.sample_rate : 0;
+}
+
 extern "C" void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads) {
     if (!ctx || n_threads <= 0)
         return;
@@ -3112,11 +2691,7 @@ extern "C" void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads) 
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
 }
 
-// Runtime length-scale setter (PLAN #88). The duration-predictor
-// output gets multiplied by this scalar BEFORE the banker's round +
-// clamp-min-1 in the "durations" stage extractor. Read on every
-// synthesize call, so post-init mutation just changes the next
-// call's pacing.
+// The duration-predictor output is scaled before rounding and clamping.
 extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale) {
     if (!ctx)
         return;
@@ -3153,4 +2728,3 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
         ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
-

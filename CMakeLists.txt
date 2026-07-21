@@ -103,6 +103,11 @@ target_link_libraries(kokoro PUBLIC
     PkgConfig::ESPEAK_NG
 )
 
+# Strict warnings for project-owned code (not propagated to ggml)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(kokoro PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
+
 target_compile_definitions(kokoro PRIVATE
     KOKORO_BUILD
 )
@@ -117,6 +122,9 @@ if(KOKORO_BUILD_CLI)
     target_include_directories(kokoro-cli PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(kokoro-cli PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()
 
 # ===========================================================================
@@ -126,10 +134,13 @@ endif()
 if(KOKORO_BUILD_TESTS)
     enable_testing()
 
-    add_executable(test-tokenizer tests/test-tokenizer.cpp)
-    target_link_libraries(test-tokenizer PRIVATE kokoro)
-    target_include_directories(test-tokenizer PRIVATE
+    add_executable(test-smoke tests/test-smoke.cpp)
+    target_link_libraries(test-smoke PRIVATE kokoro)
+    target_include_directories(test-smoke PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
-    add_test(NAME tokenizer COMMAND test-tokenizer)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test-smoke PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME smoke COMMAND test-smoke)
 endif()

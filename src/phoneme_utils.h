@@ -1,7 +1,4 @@
-// phonemizer.h — minimal stub for kokoro.cpp standalone build.
-// Provides only the strip_espeak_lang_markers utility used by the
-// kokoro synthesis path. Full multi-backend G2P is not needed — we use
-// espeak-ng (always linked).
+// Utilities for normalizing espeak-ng phoneme output.
 #pragma once
 
 #include <string>
@@ -9,7 +6,7 @@
 namespace kokoro_phon {
 
 // Strip espeak-ng language-switch markers like (en), (it), (de-AT) from
-// IPA output. Derived from CrispASR phonemizer.h.
+// IPA output.
 inline void strip_espeak_lang_markers(std::string& ipa) {
     size_t out = 0;
     size_t len = ipa.size();
@@ -44,11 +41,4 @@ inline void strip_espeak_lang_markers(std::string& ipa) {
     }
     ipa.resize(out);
 }
-
-// Stubs for builtin G2P — always return false so espeak path is taken.
-inline bool phonemize_builtin_en(const std::string&, const std::string&, std::string&) { return false; }
-inline bool phonemize_builtin_de(const std::string&, const std::string&, std::string&) { return false; }
-inline bool phonemize_builtin_fr(const std::string&, const std::string&, std::string&) { return false; }
-inline bool phonemize_builtin_es(const std::string&, const std::string&, std::string&) { return false; }
-
 } // namespace kokoro_phon

@@ -268,7 +268,6 @@ static inline ggml_tensor* conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
     if (!fc || !fc->enabled)
         return conv1d(ctx, x, w, b, K, dil);
     ggml_tensor* wf = fc->get(w);
-    const int T = (int)x->ne[1];
     const int Cin = (int)wf->ne[1];
     const int Cout = (int)wf->ne[2];
     if (K == 1 && dil == 1) {

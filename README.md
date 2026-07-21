@@ -4,7 +4,7 @@ Standalone C/C++ inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokor
 
 - **CPU-only** — no GPU required, runs anywhere
 - **C ABI** — suitable for cgo, FFI, or direct embedding
-- **Minimal dependencies** — ggml (bundled) + espeak-ng (system)
+- **Minimal dependencies** — pinned ggml submodule + espeak-ng (system)
 - **24 kHz output** — mono float32 PCM or 16-bit WAV via CLI
 
 ## Quick Start
@@ -28,6 +28,7 @@ nix-shell -p espeak-ng
 ### 2. Build
 
 ```bash
+git submodule update --init
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
@@ -98,7 +99,8 @@ The kokoro.cpp source code is MIT-licensed (see [LICENSE](LICENSE)).
 
 **Important**: This project requires [espeak-ng](https://github.com/espeak-ng/espeak-ng) as a directly-linked dependency. espeak-ng is licensed under GPLv3+. When you build and distribute the combined binary (library + espeak-ng), the result is subject to GPLv3+ terms. See [NOTICE](NOTICE) for full details.
 
-If you need a non-GPL binary, use `kokoro_synthesize_phonemes()` with externally-produced IPA and link without espeak-ng.
+The current build intentionally treats espeak-ng as a hard dependency. Even
+applications that call `kokoro_synthesize_phonemes()` must link it.
 
 ## Model Downloads
 

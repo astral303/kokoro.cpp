@@ -65,6 +65,9 @@ float* kokoro_synthesize(struct kokoro_context* ctx, const char* text, int* out_
 // Same as kokoro_synthesize but the input is already IPA — skips espeak-ng.
 float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const char* phonemes, int* out_n_samples);
 
+// Return the sample rate declared by the loaded model.
+int kokoro_sample_rate(const struct kokoro_context* ctx);
+
 void kokoro_pcm_free(float* pcm);
 
 #ifdef __cplusplus
