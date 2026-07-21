@@ -208,9 +208,11 @@ target_include_directories(kokoro PRIVATE
     ${KOKORO_GGML_DIR}/src
 )
 
+find_package(Threads REQUIRED)
 target_link_libraries(kokoro PUBLIC
     ggml
     PkgConfig::ESPEAK_NG
+    Threads::Threads
 )
 
 # Strict warnings for project-owned code (not propagated to ggml)
@@ -289,6 +291,19 @@ if(KOKORO_BUILD_TESTS)
         endif()
     endif()
     add_test(NAME align COMMAND test-align)
+
+    add_executable(test-har-async tests/test-har-async.cpp)
+    target_include_directories(test-har-async PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test-har-async PRIVATE Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test-har-async PRIVATE -Wall -Wextra -Wpedantic)
+        if(KOKORO_WERROR)
+            target_compile_options(test-har-async PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME har-async COMMAND test-har-async)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

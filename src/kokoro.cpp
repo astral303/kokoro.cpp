@@ -35,10 +35,12 @@
 #include "core/conv.h"
 #include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
 #include "core/gguf_loader.h"
+#include "core/har_async.h"
 #include "core/lstm.h"
 #include "core/kokoro_env.h"
 #include "core/log.h"
 #include "core/matmul.h"
+#include "core/m_source_host.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -55,6 +57,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cfenv>
@@ -64,8 +67,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -152,13 +158,19 @@ bool kokoro_bench_enabled() {
 
 using kokoro_bench_clock = std::chrono::steady_clock;
 
+void kokoro_bench_report(const char* name, double ms) {
+    if (!kokoro_bench_enabled())
+        return;
+    kokoro_log(KOKORO_LOG_DEBUG, "kokoro: benchmark %-22s %.2f ms", name, ms);
+}
+
 void kokoro_bench_elapsed(const char* name, kokoro_bench_clock::time_point start) {
     if (!kokoro_bench_enabled())
         return;
     const double ms = std::chrono::duration<double, std::milli>(
                           kokoro_bench_clock::now() - start)
                           .count();
-    kokoro_log(KOKORO_LOG_DEBUG, "kokoro: benchmark %-22s %.2f ms", name, ms);
+    kokoro_bench_report(name, ms);
 }
 
 struct kokoro_bench_stage {
@@ -302,6 +314,12 @@ struct kokoro_context {
 
     // Phoneme cache (lang \0 text → IPA). Lives for the life of the context.
     kokoro_phoneme_cache phon_cache;
+
+    // Host-cached m_source Linear(9→1) weights. Harmonic generation must not
+    // call ggml_backend_tensor_get while the Vulkan scheduler is computing.
+    float m_source_weight[core_m_source::kDim] = {};
+    float m_source_bias = 0.0f;
+    bool m_source_cached = false;
 };
 
 namespace {
@@ -317,6 +335,45 @@ ggml_tensor* require(const kokoro_context* c, const char* name) {
         kokoro_set_error("required tensor missing: %s", name);
     }
     return t;
+}
+
+// Cache m_source Linear(9→1) weight/bias as host floats during init. Harmonic
+// generation later must not call ggml_backend_tensor_get concurrently with
+// scheduler compute on Vulkan.
+static bool kokoro_cache_m_source(kokoro_context* c) {
+    ggml_tensor* lw = require(c, "dec.gen.m_source.weight");
+    ggml_tensor* lb = require(c, "dec.gen.m_source.bias");
+    if (!lw || !lb)
+        return false;
+    if (lw->ne[0] != core_m_source::kDim) {
+        kokoro_set_error("m_source.weight ne[0]=%lld want %d", (long long)lw->ne[0], core_m_source::kDim);
+        return false;
+    }
+
+    if (lw->type == GGML_TYPE_F16) {
+        uint16_t tmp[core_m_source::kDim];
+        ggml_backend_tensor_get(lw, tmp, 0, sizeof(tmp));
+        ggml_fp16_to_fp32_row((const ggml_fp16_t*)tmp, c->m_source_weight, core_m_source::kDim);
+    } else if (lw->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(lw, c->m_source_weight, 0, sizeof(float) * (size_t)core_m_source::kDim);
+    } else {
+        kokoro_set_error("m_source.weight unsupported type %d", (int)lw->type);
+        return false;
+    }
+
+    if (lb->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(lb, &c->m_source_bias, 0, sizeof(float));
+    } else if (lb->type == GGML_TYPE_F16) {
+        ggml_fp16_t tmp;
+        ggml_backend_tensor_get(lb, &tmp, 0, sizeof(tmp));
+        c->m_source_bias = ggml_fp16_to_fp32(tmp);
+    } else {
+        kokoro_set_error("m_source.bias unsupported type %d", (int)lb->type);
+        return false;
+    }
+
+    c->m_source_cached = true;
+    return true;
 }
 
 // Read a uint32 array from GGUF metadata into a std::vector. Empty result if
@@ -1742,8 +1799,8 @@ static inline ggml_tensor* kokoro_conv1d_ks_tf(ggml_context* ctx, ggml_tensor* i
 
 static const float kKokoroTwoPi = 6.283185307179586f;
 
-static float* kokoro_make_har(const kokoro_context* c, const float* f0_curve, int T_frames, int* out_T_har,
-                              std::mt19937& rng) {
+static float* kokoro_make_har(const float* f0_curve, int T_frames, int* out_T_har, std::mt19937& rng,
+                              const float* m_source_w, float m_source_b) {
     const int upsample_scale = 300; // prod(upsample_rates) * hop
     const int harmonic_num = 8;
     const int dim = harmonic_num + 1; // 9
@@ -1845,26 +1902,10 @@ static float* kokoro_make_har(const kokoro_context* c, const float* f0_curve, in
         }
     }
 
-    // ---- m_source: l_linear (9 → 1) + tanh ----
-    // weight ne=(9, 1) F16; bias ne=(1,) F32.
-    ggml_tensor* lw = require(c, "dec.gen.m_source.weight");
-    ggml_tensor* lb = require(c, "dec.gen.m_source.bias");
-    if (!lw || !lb)
-        return nullptr;
-    std::vector<uint16_t> w_f16((size_t)dim);
-    std::vector<float> w_f32((size_t)dim);
-    ggml_backend_tensor_get(lw, w_f16.data(), 0, (size_t)dim * sizeof(uint16_t));
-    ggml_fp16_to_fp32_row((const ggml_fp16_t*)w_f16.data(), w_f32.data(), dim);
-    float bias_v = 0.0f;
-    ggml_backend_tensor_get(lb, &bias_v, 0, sizeof(float));
-
+    // ---- m_source: l_linear (9 → 1) + tanh (host-cached weights) ----
     std::vector<float> har_source((size_t)L_high);
-    for (int t = 0; t < L_high; t++) {
-        float s = bias_v;
-        for (int k = 0; k < dim; k++)
-            s += sine_waves[(size_t)t * dim + k] * w_f32[k];
-        har_source[t] = std::tanh(s);
-    }
+    for (int t = 0; t < L_high; t++)
+        har_source[t] = core_m_source::apply(&sine_waves[(size_t)t * dim], m_source_w, m_source_b);
 
     // ---- STFT (n_fft=20, hop=5, hann periodic, center=True, pad_mode=reflect) ----
     const int pad_n = n_fft / 2; // 10
@@ -2313,6 +2354,47 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_backend_tensor_get(n_t, n_curve.data(), 0, fn_n * sizeof(float));
     kokoro_bench_elapsed("f0_noise", stage_start);
 
+    // Harmonic source depends only on f0, T_frames, cached m_source, and RNG.
+    // On Vulkan, overlap it with TextEncoder + Decoder GPU work. CPU/Metal/CUDA
+    // keep the historical serial order. KOKORO_HAR_OVERLAP=0 disables overlap.
+    const char* seed_env = kokoro_env::get("KOKORO_SEED");
+    const uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
+    std::mt19937 rng(seed);
+    bool overlap_har = (c->selected_backend == KOKORO_BACKEND_VULKAN) &&
+                       (kokoro_env::get("KOKORO_HAR_OVERLAP") == nullptr ||
+                        kokoro_env::truthy("KOKORO_HAR_OVERLAP"));
+    if (!c->m_source_cached) {
+        std::free(align_idx);
+        kokoro_set_error("m_source host cache missing");
+        return nullptr;
+    }
+
+    // Declared after f0_curve so destruction joins while f0 data is still alive.
+    core_har::AsyncResult har_async;
+    if (overlap_har) {
+        std::array<float, core_m_source::kDim> mw{};
+        std::memcpy(mw.data(), c->m_source_weight, sizeof(mw));
+        const float mb = c->m_source_bias;
+        const float* f0_ptr = f0_curve.data(); // immutable until har_async joins
+        const int T_frames_cap = T_frames;
+        try {
+            har_async = core_har::AsyncResult(std::async(
+                std::launch::async,
+                [f0_ptr, T_frames_cap, mw, mb, rng = std::move(rng)]() mutable -> core_har::ComputeResult {
+                    core_har::ComputeResult r;
+                    const auto t0 = kokoro_bench_clock::now();
+                    r.data = kokoro_make_har(f0_ptr, T_frames_cap, &r.T_har, rng, mw.data(), mb);
+                    r.work_ms = std::chrono::duration<double, std::milli>(kokoro_bench_clock::now() - t0).count();
+                    return r;
+                }));
+        } catch (...) {
+            // Thread creation can fail under resource pressure. Preserve
+            // synthesis correctness by falling back to the serial path.
+            overlap_har = false;
+            rng.seed(seed);
+        }
+    }
+
     // --- Stage 4: TextEncoder ---
     stage_start = kokoro_bench_clock::now();
     ggml_cgraph* gf_te = kokoro_build_graph_text_enc(c, L);
@@ -2349,15 +2431,34 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     ggml_backend_tensor_get(dec_out, dec_decode.data(), 0, dec_n * sizeof(float));
     kokoro_bench_elapsed("decoder", stage_start);
 
-    // --- Stage 6: HnNSF (CPU-side har generation) ---
-    stage_start = kokoro_bench_clock::now();
-    const char* seed_env = kokoro_env::get("KOKORO_SEED");
-    uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
-    std::mt19937 rng(seed);
+    // --- Stage 6: HnNSF (CPU-side har generation; possibly already running) ---
+    float* har = nullptr;
     int T_har = 0;
-    float* har = kokoro_make_har(c, f0_curve.data(), T_frames, &T_har, rng);
-    if (!har) return nullptr;
-    kokoro_bench_elapsed("harmonic_source", stage_start);
+    if (overlap_har) {
+        const auto wait_start = kokoro_bench_clock::now();
+        try {
+            auto& r = har_async.get();
+            kokoro_bench_elapsed("harmonic_wait", wait_start);
+            // Actual worker time, logged on the caller thread (not from the worker).
+            kokoro_bench_report("harmonic_source", r.work_ms);
+            if (!r.data)
+                return nullptr;
+            T_har = r.T_har;
+            har = har_async.release();
+        } catch (const std::exception& e) {
+            kokoro_set_error("harmonic generation failed: %s", e.what());
+            return nullptr;
+        } catch (...) {
+            kokoro_set_error("harmonic generation failed");
+            return nullptr;
+        }
+    } else {
+        stage_start = kokoro_bench_clock::now();
+        har = kokoro_make_har(f0_curve.data(), T_frames, &T_har, rng, c->m_source_weight, c->m_source_bias);
+        if (!har)
+            return nullptr;
+        kokoro_bench_elapsed("harmonic_source", stage_start);
+    }
 
     // --- Stage 7: Generator (produces mag + phase in one graph) ---
     stage_start = kokoro_bench_clock::now();
@@ -2613,6 +2714,12 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
 
     if (!sanity_check_weights(c)) {
         kokoro_set_error("weight sanity check failed for '%s'", path_model);
+        kokoro_free(c);
+        return nullptr;
+    }
+
+    if (!kokoro_cache_m_source(c)) {
+        // kokoro_cache_m_source already set the error.
         kokoro_free(c);
         return nullptr;
     }

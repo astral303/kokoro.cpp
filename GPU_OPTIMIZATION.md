@@ -57,16 +57,19 @@ BERT now feeds the duration predictor inside one functional graph:
 3.  F0/noise graph
       upload compact dur_enc (640,L) + indices; device ggml_get_rows → en
       download F0 and noise curves
-4.  Text encoder graph
+4.  Vulkan only: launch CPU harmonic source asynchronously
+      host-cached m_source weights + f0_curve + fixed-seed RNG
+      overlaps stages 5–6; joined before the generator
+5.  Text encoder graph
       download text encoding
-5.  Decoder graph
+6.  Decoder graph
       upload compact text_enc (512,L) + same indices; device gather → asr
       download decoder activation
-6.  CPU harmonic source generation
+7.  Join harmonic source (no-op wait when fully overlapped)
       upload decoder activation and harmonics
-7.  Generator graph
+8.  Generator graph
       download magnitude and phase
-8.  CPU iSTFT
+9.  CPU iSTFT
       return PCM
 ```
 
@@ -77,8 +80,12 @@ int32 indices instead of `(640+512)·T_frames` floats. Merging BERT with the
 duration predictor also removed the `bert_proj_out` D2H host vector, its H2D
 re-upload, one scheduler reset/allocation, and one graph submission. The
 duration vector remains the legitimate host synchronisation point for dynamic
-`T_frames`. Scheduler resets between later graphs still prevent keeping
-predictor/text-encoder allocations resident across stages.
+`T_frames`. On Vulkan, harmonic generation no longer waits for TextEncoder +
+Decoder: it starts immediately after F0/N using only host-cached `m_source`
+weights (copied at context init — never `ggml_backend_tensor_get` during
+overlap), immutable `f0_curve`, and the fixed-seed RNG. CPU/Metal/CUDA keep
+the historical serial ordering. Scheduler resets between later graphs still
+prevent keeping predictor/text-encoder allocations resident across stages.
 
 This structure was originally reasonable for CPU-only inference: a backend
 upload/download was generally a host-memory copy, and independent stages were
@@ -173,9 +180,10 @@ The following stages currently use ordinary C++ rather than GGML graphs:
 - final iSTFT.
 
 Duration/text alignment indices are still built on the host, but the feature
-expansion itself is a device gather. The harmonic source upload and
-magnitude/phase download remain real boundaries today. Moving the remaining
-CPU stages must be done only after native-kernel parity tests exist.
+expansion itself is a device gather. On Vulkan the harmonic source now overlaps
+TextEncoder + Decoder and only joins before the generator upload; the
+magnitude/phase download remains a real boundary. Moving the remaining CPU
+stages onto the device must be done only after native-kernel parity tests exist.
 
 ### 6. Scheduler fallback can hide data movement
 
@@ -486,6 +494,52 @@ Generator improved by about 25% versus the post-merge ~38 ms level. A
 `SIN`/`SQR`/`DIV` removed from those splits (one remaining `SIN` is phase), and
 reciprocal `DIV` isolated to a small prep split (`DIV: 48`).
 
+### Harmonic / TextEncoder+Decoder overlap (Vulkan)
+
+`kokoro_make_har` depends only on `f0_curve`, `T_frames`, the immutable
+`m_source` Linear(9→1) weights, and the fixed-seed RNG — not on text-encoder
+or decoder outputs. Those tiny weights are copied into host fields at context
+init (F16 or F32) so the worker never calls `ggml_backend_tensor_get` while
+the Vulkan scheduler is computing. On `KOKORO_BACKEND_VULKAN` only, harmonic
+generation launches immediately after F0/N and joins before the generator.
+CPU/Metal/CUDA keep the serial order. `KOKORO_HAR_OVERLAP=0` disables the
+overlap for A/B measurement.
+
+Worker elapsed time is recorded on the worker and logged on the caller thread
+as `harmonic_source`; `harmonic_wait` is the residual join after TextEncoder +
+Decoder. `pipeline_total` naturally reflects the overlapped wall time. RAII
+(`core_har::AsyncResult`) joins and frees on every early-return path.
+
+Correctness after this change (same hardware, seed, baseline text; graph math
+unchanged):
+
+| Model | Correlation | Relative RMS delta |
+|---|---:|---:|
+| F16 | `0.953395` | `0.304968` |
+| Q8_0 | `0.690435` | `0.785729` |
+
+These match the time-first baseline exactly. Quick-mode CPU PCM stayed
+bit-identical to the cached golden. Twelve interleaved
+`KOKORO_HAR_OVERLAP=0/1` pairs produced bit-identical Vulkan WAVs.
+
+Twelve interleaved `KOKORO_BENCH=1` F16 pairs on the RX 7900 XTX:
+
+| Stage | Serial median | Overlap median |
+|---|---:|---:|
+| Harmonic source (worker) | 8.86 ms | 9.93 ms |
+| Harmonic wait (join) | — | 0.00 ms |
+| Text encoder + decoder | 13.04 ms | 13.15 ms |
+| Generator | 28.27 ms | 21.16 ms |
+| Complete synthesis pipeline | 93.25 ms | 77.00 ms |
+
+Pipeline median improved by 16.25 ms (mean 16.91 ms; every paired run ≥13.45
+ms). The harmonic wait is effectively zero, so the ~9 ms CPU harmonic work is
+fully hidden behind TextEncoder + Decoder. The generator also ran ~7 ms faster
+in the overlapped configuration under the same interleaved protocol; treat
+that as an observed scheduling effect, not as a change to generator graph math:
+removing the CPU-only gap keeps the Vulkan queue busy immediately before the
+generator and likely avoids device clock/queue warm-up loss.
+
 ### Phase B — stable intermediate-stage diagnostics
 
 Add a test-only observer or diagnostic executable that captures existing host
@@ -523,6 +577,8 @@ metric implementation as WAV comparison.
   so compact encodings are not downloaded only to be re-uploaded.
 - Keep F0/noise tensors resident for the decoder while downloading only the F0
   data required by the current CPU harmonic generator.
+- Done (Vulkan): overlap CPU harmonic generation with TextEncoder + Decoder
+  after hosting `m_source` weights; join before the generator.
 - Connect decoder output directly to the generator.
 
 Each merge should remove one boundary and retain the previous path as a
