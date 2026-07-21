@@ -103,10 +103,8 @@ target_link_libraries(kokoro PUBLIC
     PkgConfig::ESPEAK_NG
 )
 
-# Define CRISPASR_HAVE_ESPEAK_NG so the direct-linkage code path is active
-# (not the dlopen or popen paths).
 target_compile_definitions(kokoro PRIVATE
-    CRISPASR_HAVE_ESPEAK_NG
+    KOKORO_BUILD
 )
 
 # ===========================================================================

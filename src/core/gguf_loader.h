@@ -93,15 +93,9 @@ std::vector<float> kv_f32_array(gguf_context* gctx, const char* key);
 
 // CROSS-REPO TENSOR-MAP CONTRACT (read before changing the map type!)
 // ------------------------------------------------------------------
-// `core/gguf_loader.{h,cpp}` exists in BOTH CrispASR and CrispEmbed. When
-// CrispEmbed builds, it compiles CrispASR's `crisp_audio`/`crisp_lid` sources
+// `core/gguf_loader.{h,cpp}` exists in BOTH kokoro.cpp and CrispEmbed. When
+// CrispEmbed builds, it compiles kokoro.cpp's `crisp_audio`/`crisp_lid` sources
 // against CrispEmbed's copy of this header (they link `crispembed-core`).
-// CrispASR standalone prefers `std::map`; CrispEmbed prefers
-// `std::unordered_map` (faster). A consumer doing
-// `ctx.tensors = std::move(wl.tensors)` needs its field to be the SAME type as
-// `WeightLoad::tensors` — but that type differs per repo. Hard-coding either
-// type in the consumer broke the other build, causing the repeated
-// std::map<->unordered_map flip-flop (commits e6693b23/ad869798/d1bd3b91/
 // 1e4f1184/844f89d3, …).
 //
 // FIX: expose the type as a single alias `core_gguf::tensor_map`. Each repo's
@@ -203,7 +197,7 @@ void free_weights(WeightLoad& wl);
 // accessed in random order (e.g., the per-layer KV revisit pattern of
 // decode steps), and that readahead is therefore wasted IO. No-op if
 // the buffer wasn't allocated through one of our mmap paths (e.g.,
-// when `CRISPASR_GGUF_MMAP=0` opts out of the default mmap loader).
+// when `KOKORO_GGUF_MMAP=0` opts out of the default mmap loader).
 // Safe to call multiple times.
 //
 // Recommended use: after prefill completes, before entering the decode

@@ -1,15 +1,15 @@
 // phonemizer.h — minimal stub for kokoro.cpp standalone build.
 // Provides only the strip_espeak_lang_markers utility used by the
 // kokoro synthesis path. Full multi-backend G2P is not needed — we use
-// espeak-ng directly via CRISPASR_HAVE_ESPEAK_NG.
+// espeak-ng (always linked).
 #pragma once
 
 #include <string>
 
-namespace crispasr {
+namespace kokoro_phon {
 
 // Strip espeak-ng language-switch markers like (en), (it), (de-AT) from
-// IPA output. Copied verbatim from CrispASR/src/phonemizer.h.
+// IPA output. Derived from CrispASR phonemizer.h.
 inline void strip_espeak_lang_markers(std::string& ipa) {
     size_t out = 0;
     size_t len = ipa.size();
@@ -51,4 +51,4 @@ inline bool phonemize_builtin_de(const std::string&, const std::string&, std::st
 inline bool phonemize_builtin_fr(const std::string&, const std::string&, std::string&) { return false; }
 inline bool phonemize_builtin_es(const std::string&, const std::string&, std::string&) { return false; }
 
-} // namespace crispasr
+} // namespace kokoro_phon

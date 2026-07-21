@@ -246,7 +246,7 @@ struct MappedFile {
     MappedFile& operator=(const MappedFile&) = delete;
 
     // Transfer ownership of the mmap region out of the RAII handle so it
-    // outlives the destructor. Used by the CRISPASR_GGUF_MMAP=1 path to
+    // outlives the destructor. Used by the KOKORO_GGUF_MMAP=1 path to
     // hand the mapping to a backend buffer that owns it for the model's
     // lifetime.
     void release() {
@@ -385,11 +385,11 @@ static gpu_mmap_handle lookup_gpu_mmap(ggml_backend_buffer_t buf) {
 // testing matches llama.cpp's behaviour and resolves the slow-load
 // reports.
 //
-// Opt out with `CRISPASR_GGUF_MMAP=0` for users whose model files live
+// Opt out with `KOKORO_GGUF_MMAP=0` for users whose model files live
 // on volumes that may disappear mid-run (network mounts, removable
 // disks); mmap-backed weights SIGBUS if the underlying file vanishes.
 static bool mmap_loader_enabled() {
-    const char* v = std::getenv("CRISPASR_GGUF_MMAP");
+    const char* v = std::getenv("KOKORO_GGUF_MMAP");
     if (!v || !*v)
         return true;
     return *v != '0';
@@ -402,7 +402,7 @@ static bool mmap_loader_enabled() {
 // volatile read per page; Linux MADV_POPULATE_READ would be a cleaner
 // single-syscall version when available.
 static bool preload_enabled() {
-    const char* v = std::getenv("CRISPASR_GGUF_PRELOAD");
+    const char* v = std::getenv("KOKORO_GGUF_PRELOAD");
     return v && *v && *v != '0';
 }
 static void preload_pages(void* base, size_t size) {
@@ -430,7 +430,7 @@ static void preload_pages(void* base, size_t size) {
 // GB). Failure (typically RLIMIT_MEMLOCK exceeded) prints a warning
 // and continues — mmap'd weights still work, just without the pin.
 static bool mlock_enabled() {
-    const char* v = std::getenv("CRISPASR_MLOCK");
+    const char* v = std::getenv("KOKORO_MLOCK");
     return v && *v && *v != '0';
 }
 static void try_mlock(const char* tag, void* base, size_t size) {
@@ -524,7 +524,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
     // the weights — the difference between a 14.9 GB F16 GGUF loading on
     // a 16 GB Mac and thrashing swap. Default-on as of issue #94 (slow /
     // failing chatterbox-turbo load on macOS); opt out with
-    // `CRISPASR_GGUF_MMAP=0`.
+    // `KOKORO_GGUF_MMAP=0`.
     if (mmap_loader_enabled() && ggml_backend_is_cpu(backend)) {
         MappedFile mf(path, /*writable=*/true);
         if (mf.ok) {
@@ -758,7 +758,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
         // mmap path already hints WILLNEED (line 526) for the same
         // reason; doing it here brings the legacy path's load time
         // back in line for users who opt out of the zero-copy path
-        // with CRISPASR_GGUF_MMAP=0 (e.g. model files on network
+        // with KOKORO_GGUF_MMAP=0 (e.g. model files on network
         // mounts where mmap would SIGBUS on disconnect).
 #if !defined(_WIN32)
         if (!include_tensor)

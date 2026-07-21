@@ -1,8 +1,8 @@
-// gpu_backend_pref.h — CPU-only stub for kokoro.cpp standalone build.
-// CrispASR uses this to select Metal/CUDA/Vulkan; we always return nullptr.
+// core/gpu_backend_pref.h — CPU-only stub for kokoro.cpp standalone build.
+// Always returns nullptr; GPU backends are not supported in this project.
 #pragma once
 #include "ggml-backend.h"
 
-static inline ggml_backend_t crispasr_init_gpu_backend() {
+static inline ggml_backend_t kokoro_init_gpu_backend() {
     return nullptr;
 }
