@@ -201,6 +201,23 @@ owns GGML logging. The same rule applies to proposed workarounds such as
 setting `GGML_VK_DISABLE_F16` from library code: experiments may set it in the
 launcher, but the library must not mutate the process environment.
 
+Backend controls need an explicit ownership/lifetime classification:
+
+| Control class | Examples | Owner and lifetime |
+|---|---|---|
+| Build capability | `KOKORO_VULKAN`, `KOKORO_CUDA`, external `ggml` target | Build system; determines which backend symbols/implementations exist |
+| Kokoro context policy | backend, device, thread count; future stable optimisation flags | `kokoro_params`; fixed when a context is created and independent between contexts where GGML permits |
+| Kokoro experimental/debug control | `KOKORO_HAR_OVERLAP`, `KOKORO_LSTM_BATCH`, `KOKORO_BENCH` | Kokoro/launcher; should migrate to typed context options if promoted to supported API |
+| GGML backend policy | `GGML_VK_ALLOW_GRAPHICS_QUEUE`, `GGML_VK_DISABLE_F16`, Vulkan submit/queue variables | Embedding host; process-global and generally fixed by the first backend initialisation |
+
+An extensive Kokoro knob API should expose Kokoro-owned graph/scheduling
+choices through typed init options rather than setting environment variables.
+GGML-owned variables must remain host/launcher controls: copying them into
+`kokoro_params` would falsely imply per-context scope and would require Kokoro
+to mutate shared process state. The standalone CLI may offer convenience flags
+that set GGML variables before it calls any GGML/Kokoro API because the CLI
+owns that process; an embedding library API must not do so.
+
 ## Correctness gates
 
 Optimisations are evaluated in layers. A later gate does not replace an earlier
@@ -386,7 +403,9 @@ steady-state library benchmarks.
 With `KOKORO_BENCH=1`, the CLI installs a Kokoro log callback and reports
 synchronised pipeline-stage times. Five F16 runs of the baseline fixture on the
 RX 7900 XTX gave these representative medians **before** merging BERT into the
-duration predictor:
+duration predictor and **before** `GGML_VK_ALLOW_GRAPHICS_QUEUE` (default
+compute queue). Do not compare these stage numbers directly to later
+graphics-queue audit tables:
 
 | Stage | Median |
 |---|---:|
@@ -601,7 +620,10 @@ or remove a boundary that blocks overlap with it. Reducing a stage that is 10%
 of total runtime to zero can save at most 10%; reducing its kernel count without
 moving end-to-end latency is not sufficient reason to keep a complex rewrite.
 
-Representative F16 pipeline medians on the RX 7900 XTX evolved as follows:
+Representative F16 pipeline medians on the RX 7900 XTX evolved as follows.
+**This snapshot is pre-`GGML_VK_ALLOW_GRAPHICS_QUEUE`** (default compute-queue
+selection). The follow-up audit below then measures the graphics-capable queue
+(~59 ms F16 median on the same fixture) as a separate host-configured step.
 
 | State | Pipeline median | Change from initial |
 |---|---:|---:|
@@ -615,7 +637,7 @@ These rows come from separate interleaved experiments rather than one synthetic
 sum of kernel times. The final number is steady-state synthesis-pipeline time;
 CLI model loading and WAV writing are excluded.
 
-At this point the largest remaining regions are approximately:
+At this pre-graphics-queue point the largest remaining regions are approximately:
 
 - BERT + duration predictor: 20 ms;
 - generator: 21 ms;
@@ -623,10 +645,518 @@ At this point the largest remaining regions are approximately:
 - decoder: 7–8 ms;
 - text encoder: 3–4 ms.
 
+(With the graphics-capable queue those recurrent stages drop further — see the
+queue A/B stage table — while generator/decoder can move slightly the other way.)
+
 The generator's large convolutions already reach high throughput in Vulkan
 `mul_mat` kernels. The recurrent regions remain launch-heavy even after
 direction batching: their timestep dependency prevents batching across time,
 and there is no native GGML LSTM operation.
+
+## Follow-up no-kernel-patch audit
+
+A follow-up audit on the same RX 7900 XTX looked specifically for improvements
+that use existing GGML/Vulkan behaviour and operations without changing GGML
+operators or shaders. It found one material host-configured improvement, ruled
+out one plausible Vulkan tuning direction, and identified several smaller
+application-graph experiments. Measurements in this section used Kokoro commit
+`df4f978` and GGML commit `9be31331` on 2026-07-21.
+
+Unless noted otherwise, every rejected experiment below was gated by a temporary
+`KOKORO_*` selector that **no longer exists in source**. Metric tables and
+fixture notes are retained as historical evidence; those selector values are not
+runnable on the current tree. Current intended instrumentation is only
+`KOKORO_BENCH` (including lifecycle / `har_phase.*` output) and CLI
+`KOKORO_BENCH_ITERS`.
+
+### RADV graphics-capable queue selection — confirmed improvement
+
+GGML Vulkan normally prefers a compute queue family that does not advertise
+graphics support. Upstream GGML also exposes
+`GGML_VK_ALLOW_GRAPHICS_QUEUE=1`, with a source comment noting that allowing
+the graphics-capable queue can improve RADV performance.
+
+This is a **runtime GGML implementation feature, not a Kokoro/GGML compile-time
+option**. The Vulkan code calls `getenv("GGML_VK_ALLOW_GRAPHICS_QUEUE")` while
+the process-global Vulkan instance/device and queue families are first created.
+The check is presence-based: any defined value, including `0`, enables it;
+disable it by leaving/unsetting the variable. Once any code in the process has
+caused `ggml_vk_instance_init()` (for example through Vulkan backend
+registration, device enumeration, or backend creation), changing the variable
+is too late and cannot reselect queues.
+
+Linkage does not change those runtime semantics:
+
+- the bundled GGML baseline (`9be31331`, GGML 0.17.0) supports the variable;
+- the override was introduced upstream by GGML commit `16dca8ea`;
+- a compatible external/static/shared GGML implementation that contains that
+  code reads the same process environment at runtime;
+- an older or divergent external GGML that lacks the implementation silently
+  ignores the variable—there is no public GGML capability query for this
+  environment knob;
+- if another model or component already initialised the shared external GGML
+  Vulkan backend, Kokoro must accept the queue policy already chosen.
+
+Therefore the host/launcher must set it before any shared GGML Vulkan API is
+used. Kokoro library code must not set it. Reproducible reports should record
+the linked `ggml_version()` / `ggml_commit()`, the variable's presence, and
+whether another component may have initialised Vulkan first.
+
+Interleaved queue-off/queue-on runs used the documented baseline text, fixed
+seed, current F16/Q8_0 models, and the fully optimised Kokoro graph. Ten F16
+pairs and eight Q8_0 pairs gave:
+
+| Model | Default queue median | Graphics-capable queue median | Paired median delta |
+|---|---:|---:|---:|
+| F16 | `65.16 ms` | `59.33 ms` | **`-6.02 ms` (-9.2%)** |
+| Q8_0 | `76.24 ms` | `70.41 ms` | **`-5.94 ms` (-7.8%)** |
+
+The F16 stage medians show why this is a workload-level choice rather than a
+universally faster queue:
+
+| Stage | Default queue | Graphics-capable queue | Paired median delta |
+|---|---:|---:|---:|
+| BERT + predictor | `19.81 ms` | `14.63 ms` | `-5.41 ms` |
+| F0/noise | `10.82 ms` | `8.20 ms` | `-2.58 ms` |
+| Text encoder | `3.74 ms` | `2.92 ms` | `-0.87 ms` |
+| Decoder | `7.92 ms` | `8.88 ms` | `+0.77 ms` |
+| Generator | `21.55 ms` | `23.52 ms` | `+1.68 ms` |
+| Complete pipeline | `65.16 ms` | `59.33 ms` | **`-6.02 ms`** |
+
+All ten F16 queue-off/on WAV pairs and all eight Q8_0 pairs were bit-identical.
+The quick backend validation also passed with the override:
+
+```bash
+GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+  tools/run_backend_validation.sh \
+    --backend vulkan --quick --skip-build
+```
+
+This is therefore a validated opt-in for the tested RADV/RX 7900 XTX system,
+not a portable default. A graphics-capable queue may contend with a desktop,
+game, compositor, or another Vulkan client, and other drivers/devices may make
+different queue-family trade-offs. Hosts should A/B it on their own workload.
+
+### Vulkan command-submit sizing — measured, not retained
+
+The launch-heavy LSTM graphs made `GGML_VK_MAX_NODES_PER_SUBMIT` look like a
+promising way to reduce command submission/fence overhead. GGML defaults to
+100 graph nodes per submit. Six-run F16 sweeps found:
+
+| Nodes per submit | Pipeline median |
+|---:|---:|
+| 25 | `65.84 ms` |
+| 50 | `66.61 ms` |
+| **100 (default)** | **`65.62 ms`** |
+| 200 | `66.20 ms` |
+| 400 | `67.96 ms` |
+| 800 | `69.45 ms` |
+| 1,600 | `69.15 ms` |
+| 10,000 | `69.66 ms` |
+
+The default was effectively optimal; increasing the command batch made the
+pipeline slower. Do not assume that fewer Vulkan submissions improve this
+graph without repeating the sweep after a material GGML/driver/workload change.
+
+Forcing `GGML_VK_ASYNC_USE_TRANSFER_QUEUE=1` while using the graphics-capable
+queue produced only a noisy approximately `-0.4 ms` paired median in eight
+pairs, with no consistent stage-level signal. It is not retained as a
+recommendation.
+
+### Measured and rejected: pack generator style-conditioned affine projections
+
+Historical selector `KOKORO_STYLE_PACK` (removed): pack the Vulkan generator's
+48 AdaIN style matvecs into one `18432×128` matvec. CPU/non-Vulkan unchanged;
+no GGML patch. Bit-identical (`sha256 a0457769aa8e…`); quick validation passed.
+
+`GGML_VK_PERF_LOGGER=1`:
+
+| Generator style matvec | Baseline (`KOKORO_STYLE_PACK=0`) | Packed (default) |
+|---|---:|---:|
+| `MUL_MAT(_ADD)_VEC` `m=512,k=128` (C=256) | 24 | 0 |
+| `MUL_MAT(_ADD)_VEC` `m=256,k=128` (C=128) | 24 | 0 |
+| `MUL_MAT_ADD_VEC` `m=18432,k=128` | 0 | 1 |
+| Total generator style matvecs | **48** | **1** |
+
+Twelve interleaved F16 pairs (`KOKORO_BENCH=1`, same fixture):
+
+| Metric | Baseline (`KOKORO_STYLE_PACK=0`) | Packed (default) |
+|---|---:|---:|
+| Pipeline median | `60.68 ms` | `60.61 ms` |
+| Generator median | `24.87 ms` | `24.83 ms` |
+| Paired pipeline median delta | — | **`-0.74 ms`** |
+| Paired generator median delta | — | **`-0.05 ms`** |
+| Opt-faster pairs (pipeline) | — | `7/12` |
+| Paired pipeline delta range | — | `-5.95 … +4.43 ms` |
+
+**Not retained** — dispatch fell, wall time flat/noisy vs packing complexity.
+
+### Measured and rejected: disable production diagnostic roots
+
+Historical selector `KOKORO_DIAG_ROOTS` (removed): gate unused diagnostic graph
+roots / forced CONT copies (`pred_lstm_out`, `pred_shared_out`, six
+`pred_{f0,n}_{*}_out`, `dec_encode_out`, `gen_pre_post_out`). Production needs
+only `dur_enc_out`, `durations_pre`, `f0_curve`, `n_curve`, `text_enc_out`,
+`dec_decode_3_out`, `mag`, and `phase`. Bit-identical; model-free ctest and
+quick validation passed.
+
+Twelve interleaved F16 pairs (`KOKORO_BENCH=1`, same fixture):
+
+| Metric | Diagnostic roots on (`KOKORO_DIAG_ROOTS=1`) | Roots gated off (default) |
+|---|---:|---:|
+| Pipeline median | `58.72 ms` | `58.75 ms` |
+| Paired median delta | — | **`+0.10 ms`** |
+| Opt-faster pairs | — | `6/12` |
+| Paired delta range | — | `-1.00 … +3.91 ms` |
+
+**Not retained** — flat/noisy vs code complexity.
+
+### Measured and rejected: native ConvTranspose1d on the time-first generator
+
+Historical selector `KOKORO_NATIVE_CONVT` (removed): replace the F32
+`mul_mat + col2im_1d` upsample decomposition with native
+`ggml_conv_transpose_1d` (F32 or F16). GGML Vulkan only ships an F32
+`CONV_TRANSPOSE_1D` pipeline, so F16 mode CPU-offloads. Quick validation
+passed; F16-model pairs near-identical but not bit-identical
+(corr ≈ `0.99993`, rel_rms ≈ `0.0118`).
+
+`GGML_VK_PERF_LOGGER=1`:
+
+| Generator upsample path | Baseline | Native F32 (`KOKORO_NATIVE_CONVT=1`) |
+|---|---:|---:|
+| `COL2IM_1D` | 2 | 0 |
+| `MUL_MAT f32` upsample (`m=5120` / `m=1536`) | 2 (~0.26 ms combined) | 0 |
+| `CONV_TRANSPOSE_1D` | 0 | **2 (~6.53 ms + ~9.68 ms)** |
+
+Twelve interleaved F16 pairs (`KOKORO_BENCH=1`, same fixture):
+
+| Metric | Baseline (decomp) | Native F32 |
+|---|---:|---:|
+| Pipeline median | `59.07 ms` | `73.81 ms` |
+| Generator median | `23.48 ms` | `37.75 ms` |
+| Paired pipeline median delta | — | **`+13.95 ms`** |
+| Paired generator median delta | — | **`+14.21 ms`** |
+| Native-faster pairs (pipeline) | — | **`0/12`** |
+| Paired pipeline delta range | — | `+11.76 … +19.34 ms` |
+
+Native F16 smoke: pipeline `226.66 ms`, generator `191.59 ms` (CPU offload).
+**Not retained** — materially slower than the existing decomposition.
+
+### Measured and rejected: stage-selective `GGML_PREC_DEFAULT`
+
+Historical selector `KOKORO_VK_MULMAT_DEFAULT` (removed): request
+`GGML_PREC_DEFAULT` around selected graph builders instead of the usual
+`GGML_PREC_F32` wrapper. Ordinary `ggml_conv_1d` already uses DEFAULT.
+
+| Stage token | Wrapper `mul_mat` sites that flip to DEFAULT | PCM vs F32 wrapper |
+|---|---|---|
+| `decoder` | AdaIN style matvecs only (`n=1`) | **bit-identical** |
+| `generator` | AdaIN style matvecs + 2 F32×F32 upsample decomp mats | **bit-identical** |
+| `text` | 1 LSTM input proj (`n=L`) + recurrent matvecs | stable different hash |
+| `f0` | shared LSTM / AdaIN projections | stable different hash |
+| `bert_predictor` | BERT attentions/FFN + duration LSTMs/projections | stable different hash |
+
+| Mode | Samples | vs F32 hash | corr / rel_rms vs F32 | Pipeline paired median (12) | Faster pairs |
+|---|---:|---|---:|---:|---:|
+| `text` | 61800 | changed | `0.999901` / `0.01404` | **+0.30 ms** | 5/12 |
+| `f0` | 61800 | changed | `0.989255` / `0.1465` | −0.29 ms | 7/12 |
+| `text,decoder,generator` | 61800 | same as `text` | `0.999901` / `0.01404` | **+0.48 ms** | 6/12 |
+| `text,decoder,generator,f0` | 61800 | changed | `0.989329` / `0.1461` | +0.14 ms | 5/12 |
+| `decoder` / `generator` alone | 61800 | **identical** | `1.0` / `0` | (no retention bench) | — |
+
+Quick validation vs cached CPU:
+
+| Mode | CPU/Vulkan corr | Relative RMS |
+|---|---:|---:|
+| unset F32 wrapper (baseline) | `0.970886` | `0.241052` |
+| `text` | `0.971615` | `0.238003` |
+| `text,decoder,generator` | `0.971615` | `0.238003` |
+| `f0` | `0.886627` | `0.475426` |
+| `bert_predictor` (diagnostic) | `0.936632` | `0.355386` |
+
+**Not retained** — stages that change numerics are flat/noisy on latency;
+decoder/generator DEFAULT is a no-op on this backend.
+
+### Measured: graph lifecycle subphases; rejected per-stage schedulers
+
+`KOKORO_BENCH=1` emits synchronized subphase timers for each GPU stage
+(`bert_predictor`, `f0_noise`, `text_encoder`, `decoder`, `generator`) at
+existing sync points only (no extra `ggml_backend_sched_synchronize`):
+
+| Subphase | What it covers |
+|---|---|
+| `graph_build` | `kokoro_build_graph_*` |
+| `reset_alloc` | `ggml_backend_sched_reset` + `alloc_graph` |
+| `upload` | input `ggml_backend_tensor_set` |
+| `compute` | `ggml_backend_sched_graph_compute` (includes its sync) |
+| `download` | output `ggml_backend_tensor_get` |
+| `host` | unavoidable host prep (lookups, vector alloc, frees) |
+
+Fifteen process runs after two warmups (same fixture). WAV hash stable
+(`a0457769aa8e…`). Subphase medians (ms):
+
+| Stage | graph_build | reset_alloc | upload | compute | download | host | Stage total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BERT + predictor | `0.31` | `1.58` | `0.00` | `12.90` | `0.15` | `0.05` | `15.02` |
+| F0/noise | `0.20` | `1.06` | `0.01` | `6.87` | `0.11` | `0.03` | `8.30` |
+| Text encoder | `0.08` | `0.50` | `0.00` | `2.21` | `0.07` | `0.01` | `2.87` |
+| Decoder | `0.05` | `0.26` | `0.00` | `8.22` | `0.15` | `0.02` | `8.71` |
+| Generator | `0.17` | `0.64` | `0.08` | `22.27` | `0.32` | `0.08` | `23.59` |
+| **Sum** | **`0.81`** | **`4.04`** | **`0.09`** | **`52.47`** | **`0.80`** | **`0.19`** | — |
+
+Pipeline median `59.93 ms`. Host-side lifecycle ceiling (everything except
+`compute`) is **`5.93 ms` (~10%)**, dominated by `reset_alloc` (`4.04 ms`).
+Transfers are tiny (`0.89 ms` combined).
+
+Historical selector `KOKORO_STAGE_SCHED` (removed): five independent schedulers
+to keep per-stage gallocr plans warm. Bit-identical; quick validation matched
+baseline. CLI gained `KOKORO_BENCH_ITERS` (requires `KOKORO_BENCH=1`) for the
+warm measurement — that CLI hook is retained.
+
+Twelve interleaved cold process pairs:
+
+| Metric | Baseline | `KOKORO_STAGE_SCHED=1` |
+|---|---:|---:|
+| Pipeline median | `59.92 ms` | `61.55 ms` |
+| Paired pipeline median delta | — | **`+1.55 ms`** |
+| Opt-faster pairs | — | **`1/12`** |
+| Paired delta range | — | `-0.48 … +6.28 ms` |
+
+Twelve interleaved in-process warm pairs (`KOKORO_BENCH_ITERS=6`, iters 1…5):
+
+| Metric | Baseline warm | Stage-sched warm |
+|---|---:|---:|
+| Pipeline median (all warms) | `44.23 ms` | `43.44 ms` |
+| Paired warm pipeline median delta | — | **`-0.35 ms`** |
+| Opt-faster pairs | — | `8/12` |
+| Paired delta range | — | `-3.71 … +2.42 ms` |
+| Warm `reset_alloc` sum median | `4.00 ms` | `3.63 ms` (`-0.41 ms` paired) |
+
+**Not retained** — cold regresses; warm flat/noisy. Most of the `4.04 ms` is
+structural `split_graph`, not buffer re-reserve. Subphase timers kept.
+Persistent-transfer / graph-cache follow-ups are deprioritized by these ceilings.
+
+### Measured: shared predictor reverse-time index; rejected
+
+Historical selector `KOKORO_LSTM_SHARE_REV_IDX` (removed): share one functional
+I32 reverse index across the four same-length predictor LSTMs. Bit-identical;
+quick validation matched baseline.
+
+`GGML_VK_PERF_LOGGER=1` on `bert_predictor` (`CAST` logged as `CPY`):
+
+| Op | Baseline (`SHARE_REV_IDX=0`) | Shared (default) | Delta |
+|---|---:|---:|---:|
+| `ARANGE` | 8 | 2 | −6 |
+| `SCALE` | 4 | 1 | −3 |
+| `ADD` | 320 | 317 | −3 |
+| `CPY` (cast) | 5 | 2 | −3 |
+| `GET_ROWS` | 10 | 10 | 0 |
+
+Twelve interleaved process-per-run F16 pairs (same fixture):
+
+| Metric | Baseline (`KOKORO_LSTM_SHARE_REV_IDX=0`) | Shared (default) |
+|---|---:|---:|
+| Pipeline median | `59.23 ms` | `59.94 ms` |
+| `bert_predictor` median | `14.61 ms` | `14.87 ms` |
+| Paired pipeline median delta | — | **`+0.61 ms`** |
+| Paired `bert_predictor` median delta | — | **`+0.26 ms`** |
+| Opt-faster pairs (pipeline) | — | **`4/12`** |
+| Paired pipeline delta range | — | `-4.58 … +3.92 ms` |
+
+**Not retained** — dispatch saving is real but below wall-time noise.
+
+### Measured: persistent LSTM gate reorder `i,f,g,o` → `i,f,o,g`; rejected
+
+Historical selector `KOKORO_LSTM_GATE_REORDER` (removed, F16-only): persistently
+swap `g`/`o` gate rows so sigmoid can be one contiguous `3H` view. Bit-identical;
+quick validation matched baseline. Q8_0 not extended.
+
+`GGML_VK_PERF_LOGGER=1`:
+
+| Op launches (sum of stage blocks) | Baseline (`GATE_REORDER=0`) | Reordered (default) | Delta |
+|---|---:|---:|---:|
+| `SIGMOID` | **979** (`537+308+134`) | **329** (`181+103+45`) | **−650** |
+| `TANH` | 656 | 656 | 0 |
+
+Twelve interleaved process-per-run F16 pairs (`KOKORO_BENCH=1`, same fixture):
+
+| Metric | Baseline (`KOKORO_LSTM_GATE_REORDER=0`) | Reordered (default) |
+|---|---:|---:|
+| Pipeline median | `60.20 ms` | `60.56 ms` |
+| Paired pipeline median delta | — | **`+1.01 ms`** |
+| Opt-faster pairs (pipeline) | — | **`4/12`** |
+| Paired pipeline delta range | — | `-2.05 … +3.87 ms` |
+
+**Not retained** — wider `3H` sigmoid offsets the dispatch win (same lesson as
+contiguous I/F batching).
+
+### Remaining LSTM micro-optimisations
+
+No existing GGML operation provides an exact LSTM scan. Application-only ideas
+on this fixture are low-ceiling:
+
+- Done / rejected: shared reverse-time index and gate reorder (above).
+- Deprioritized: persistently prepack direction weights/biases.
+
+Vulkan can fuse `MUL_MAT → ADD` / `MUL_MAT → ADD → ADD` for single-row matvecs
+with matching bias shape; direction-batched LSTM uses `ne[2]=2` and is not
+eligible. Do not disable direction batching to recover that fusion.
+
+### Measured and rejected: existing-op device harmonic (`KOKORO_DEVICE_HAR`)
+
+**Formulation (existing GGML ops, no kernel patch):**
+
+```text
+nearest interpolate F0
+harmonic multipliers and fractional part
+linear downsample
+cumsum × 2π
+linear upsample
+sin
+voicing/noise affine
+Linear(9→1) + tanh
+fixed STFT matrix
+```
+
+using `ggml_interpolate`, `ggml_floor`, `ggml_cumsum`, `ggml_sin`, `ggml_tanh`,
+matmul, and reflection padding. Host still supplies fixed-seed `rand_ini` and
+Gaussian noise. Prototype kept STFT on host (no `atan2`; large `PAD_REFLECT_1D`
+is CPU-fallback).
+
+Ceiling first (no graph change), same fixture, n=8:
+
+| Fixture | Samples | `harmonic_source` med | `harmonic_wait` med | text+decoder med | `pipeline_total` med |
+|---|---:|---:|---:|---:|---:|
+| short (`Hello.`) | 31,800 | 5.13 ms | **0.01 ms** | 11.04 ms | 41.35 ms |
+| baseline | 61,800 | 9.91 ms | **0.01 ms** | 11.38 ms | 58.52 ms |
+| punctuation | 127,200 | 20.55 ms | **9.91 ms** | 10.69 ms | 114.61 ms |
+| long | 313,200 | 49.26 ms | **32.80 ms** | 16.44 ms | 217.11 ms |
+
+Baseline-only “wait≈0” does **not** hold: punctuation/long leave ~10–33 ms of
+CPU harmonic on the critical path. Retained `har_phase.*` timers on long:
+`upsample_sin` ~14 ms, `noise_msource` ~20 ms, `stft` ~9 ms.
+
+Historical selector `KOKORO_DEVICE_HAR` (removed): host RNG/noise overlap +
+existing-op `har_source` graph + host STFT. Noise H2D ~9·L_high vs current har
+upload ~22·T_har; same compute queue as the rest of the pipeline. CPU-backend
+graph vs host `har_source` matched (`corr=1`). Quick validation with the
+selector passed (`corr=0.969428`).
+
+| Fixture | Pipeline paired median Δ | Device-faster | Paired range | Vulkan↔Vulkan corr med |
+|---|---:|---:|---|---:|
+| baseline | **+9.48 ms** | **0/12** | +6.76…+11.84 | 0.99957 |
+| punctuation | **+2.66 ms** | 1/12 | −0.35…+5.30 | 0.99966 |
+| long | **−2.24 ms** | 9/12 | −4.73…+3.40 | 0.99856 |
+
+**Not retained** — baseline regresses; long win noisy/~2 ms. Revisit only with a
+second queue, fused device RNG+STFT (`atan2`), or long/batched throughput.
+`har_phase.*` collection stays (worker collects; caller logs after join).
+
+### Measured and rejected: Vulkan device iSTFT via existing GGML ops
+
+**Formulation (existing GGML ops, no kernel patch):**
+
+```text
+real = mag * cos(phase);  imag = mag * sin(phase)
+# DC real forced to mag (phase ignored) to match historical host iSTFT
+frames = IDFT_20x22 @ concat(real, imag)   # fixed Hermitian real inverse DFT
+frames *= periodic_Hann_20
+wave = col2im_1d(frames, stride=5, oc=1)   # overlap-add
+norm = col2im_1d(repeat(Hann²), stride=5, oc=1)
+pcm  = center_crop(wave / norm)            # length (T_har-1)*5
+```
+
+Historical selector `KOKORO_DEVICE_ISTFT` (removed): append the above to the
+Vulkan generator and download PCM. Focused CPU-backend parity matched host
+iSTFT (max abs ≤ `4.5e-8`, corr `1.0`). Quick validation passed for baseline
+and device (`corr=0.970887`). Twelve interleaved pairs: corr `0.99999924`,
+rel_rms `1.253e-3`.
+
+`GGML_VK_PERF_LOGGER=1` (generator stage block):
+
+| Op (generator timings block) | Baseline (CPU iSTFT) | Device iSTFT |
+|---|---:|---:|
+| `COL2IM_1D` (upsample) | 2 | 2 |
+| `COL2IM_1D` (iSTFT wave+norm) | 0 | **2 (~8 µs)** |
+| `MUL_MAT f32` `m=20,n=T_har,k=22` (IDFT) | 0 | **1 (~10 µs)** |
+| `COS` / extra `SIN` | 0 / 1 | **1 / 2** |
+| Generator download median | `0.35 ms` (mag+phase) | **`0.12 ms` (pcm)** |
+| Host `istft` median | `1.08 ms` | `0` (in-graph) |
+
+Twelve interleaved F16 pairs (`KOKORO_BENCH=1`, same fixture):
+
+| Metric | Baseline (CPU iSTFT) | Device iSTFT |
+|---|---:|---:|
+| Pipeline median | `59.12 ms` | `58.42 ms` |
+| Generator median | `23.62 ms` | `23.91 ms` |
+| `generator.compute` median | `22.28 ms` | `22.69 ms` |
+| Paired pipeline median delta | — | **`−0.87 ms`** |
+| Paired gen+iSTFT median delta | — | **`−0.57 ms`** |
+| Device-faster pairs (pipeline) | — | **`7/12`** |
+| Paired pipeline delta range | — | `−5.65 … +2.94 ms` |
+
+**Not retained** — ~1 ms Amdahl ceiling does not survive as stable wall-time;
+generator compute/alloc absorbs most of the host-iSTFT + download savings.
+Revisit only for long/batched device-resident pipelines.
+
+### Cumulative audit decision (final review)
+
+This follow-up no-kernel-patch audit keeps **one** host-configured latency
+optimisation and bench-only instrumentation. All measured application-graph
+and GGML-tuning experiments were reverted.
+
+**Retained (latency)**
+
+- Host opt-in `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` before Vulkan device init
+  (RADV/RX 7900 XTX: F16 paired median about −6 ms / −9%; Q8_0 about −6 ms /
+  −8%; bit-identical WAVs). Not a portable library default.
+
+**Retained (instrumentation only; no normal-path behaviour change when unset)**
+
+- `KOKORO_BENCH=1` stage timers, GPU lifecycle subphases
+  (`*.graph_build` / `*.reset_alloc` / `*.upload` / `*.compute` / `*.download` /
+  `*.host`), and CPU `har_phase.*` breakdown.
+- Harmonic subphase times are collected on the worker and reported only after
+  join on the caller thread (same policy as `harmonic_source` / `work_ms`). The
+  Kokoro log callback is never invoked from the harmonic worker.
+- CLI `KOKORO_BENCH_ITERS=N` in-process repeats, **only when** `KOKORO_BENCH=1`
+  is also set (avoids surprising multi-synthesis CLI behaviour).
+
+**Rejected / reverted (measured in this audit)**
+
+- `GGML_VK_MAX_NODES_PER_SUBMIT` sweeps (default 100 best); transfer-queue force
+- Generator AdaIN style packing (`KOKORO_STYLE_PACK`)
+- Gating unused diagnostic roots (`KOKORO_DIAG_ROOTS`)
+- Native time-first `ggml_conv_transpose_1d` (`KOKORO_NATIVE_CONVT`)
+- Stage-selective `GGML_PREC_DEFAULT` (`KOKORO_VK_MULMAT_DEFAULT`)
+- Per-stage schedulers (`KOKORO_STAGE_SCHED`)
+- Shared predictor reverse-time index (`KOKORO_LSTM_SHARE_REV_IDX`)
+- Persistent LSTM gate reorder (`KOKORO_LSTM_GATE_REORDER`)
+- Existing-op device harmonic (`KOKORO_DEVICE_HAR`)
+- Vulkan device iSTFT via existing ops (`KOKORO_DEVICE_ISTFT`)
+
+No GGML patches. No revived selector/prepack/device-graph/test sources remain
+in the tree.
+
+**Full default validation (final review)**
+
+```bash
+GGML_VK_ALLOW_GRAPHICS_QUEUE=1 \
+  tools/run_backend_validation.sh --backend vulkan
+```
+
+Outcome after final review cleanup (RX 7900 XTX, fixed seed, baseline fixture,
+2 process runs/model):
+
+| Model | Samples | CPU↔Vulkan corr | Rel RMS | Deterministic Vulkan WAV | Result |
+|---|---:|---:|---:|---|---|
+| F16 | 61800 | 0.953395 | 0.304968 | yes (`a0457769aa8e…`) | **pass** |
+| Q8_0 | 61800 | 0.690435 | 0.785729 | yes (`8cb64dbfedd4…`) | **pass** |
+
+Model-free `ctest` in `.validation/build-vulkan` also passed (5/5). Known
+full-corpus long-utterance CPU/Vulkan duration/sample-count mismatch is
+unchanged and was **not** weakened; default (non-`--full-corpus`) validation
+does not exercise that gate.
 
 ## Explored approaches that were not retained
 
@@ -642,16 +1172,27 @@ kernel, graph allocator, or workload assumption has changed.
 | Batch F0 and noise branches | Pipeline median −1.35 ms; paired median −0.82 ms | Correct and potentially useful on a higher-launch-cost backend, but too much code for the measured Vulkan gain. Native `conv_1d` could not bind per-batch weights, requiring im2col + batched matmul. |
 | Batch generator K3/K7/K11 residual branches | Pipeline **+1.15 ms** | Slower. Padding all kernels to K11 increased relevant convolution FLOPs by about 57%; the generator is compute-bound enough that fewer launches did not compensate. |
 | Replace copy boundaries by one very large post-duration graph | Flat/slightly slower | Device transfers are no longer the dominant cost at these compact boundaries. |
+| Gate unused diagnostic graph roots / forced CONT copies | Pipeline median +0.03 ms; paired median **+0.10 ms**; 6/12 faster; range −1.00…+3.91 ms | Bit-identical and low-risk, but flat/noisy vs code complexity on RADV with graphics queue. Reverted. |
+| Pack generator AdaIN style projections (48→1 matvec) | Pipeline median −0.07 ms; paired median **−0.74 ms**; generator paired **−0.05 ms**; 7/12 faster; range −5.95…+4.43 ms | Bit-identical; PERF_LOGGER showed 48→1 generator style matvecs, but wall time flat/noisy vs packing complexity. Reverted. |
+| Native time-first `ggml_conv_transpose_1d` vs F32 mul_mat+col2im | Pipeline median **+14.74 ms**; paired median **+13.95 ms**; generator paired **+14.21 ms**; **0/12** faster; range +11.76…+19.34 ms | Correct enough (corr≈0.99993) but much slower; PERF_LOGGER showed 2×`CONV_TRANSPOSE_1D` (~16.2 ms) replacing ~0.37 ms decomp. Native F16 CPU-offloads (gen ~192 ms). Reverted. |
+| Stage-selective `GGML_PREC_DEFAULT` (`KOKORO_VK_MULMAT_DEFAULT`) | `text` paired **+0.30 ms** (5/12); `f0` paired −0.29 ms (7/12); `text+decoder+generator` paired **+0.48 ms** | Decoder/generator bit-identical (matvecs + F32 decomp; `conv_1d` already DEFAULT). Text/f0 change numerics without stable latency. BERT/predictor diagnostic worsens PCM; not retained. Reverted. |
+| Per-stage schedulers (`KOKORO_STAGE_SCHED`) | Cold paired **+1.55 ms** (1/12); warm in-process paired **−0.35 ms** (8/12); warm `reset_alloc` sum only **−0.41 ms** | Host ceiling ~`5.9 ms` (`reset_alloc` 4.0). Most cost is structural `split_graph`, not re-reserve. Bit-identical; not retained. Subphase timers kept. |
+| Share predictor reverse-time I32 index (`KOKORO_LSTM_SHARE_REV_IDX`) | Pipeline paired **+0.61 ms** (4/12); `bert_predictor` paired **+0.26 ms**; range −4.58…+3.92 ms | Bit-identical; PERF_LOGGER `ARANGE` 8→2 / `SCALE` 4→1 / `ADD`/`CPY` −3 in `bert_predictor`, but wall time flat/noisy vs helper/API complexity. Reverted. |
+| Vulkan device iSTFT (`KOKORO_DEVICE_ISTFT`, existing GGML ops) | Pipeline paired **−0.87 ms** (7/12); gen+iSTFT paired **−0.57 ms**; range −5.65…+2.94 ms | Near-identical (corr `0.99999924`); PERF_LOGGER IDFT/col2im ~18 µs but generator.compute +0.41 ms absorbs host 1.08 ms + download 0.23 ms. Flat/noisy vs complexity. Reverted. |
+| Persistent LSTM gate reorder `i,f,g,o`→`i,f,o,g` (`KOKORO_LSTM_GATE_REORDER`, F16) | Pipeline paired **+1.01 ms** (4/12); range −2.05…+3.87 ms; stage paired mostly ≤0.3 ms except generator `+0.72` | Bit-identical; PERF_LOGGER `SIGMOID` **979→329**, `TANH` unchanged 656. Wider 3H sigmoid offsets dispatch savings (same lesson as I/F batching). Reverted; Q8_0 not extended. |
+| Existing-op device harmonic (`KOKORO_DEVICE_HAR`, host RNG + GPU `har_source` + host STFT) | Baseline paired **+9.48 ms** (0/12); punct **+2.66 ms** (1/12); long **−2.24 ms** (9/12); range long −4.73…+3.40 | Ceiling wait is real on punct/long (~10–33 ms) but same-queue serial device path + larger noise H2D loses short/baseline overlap; long win noisy/~2 ms. CPU graph parity fine; Vulkan PCM corr ~0.999. Reverted. |
 
 Other low-ceiling ideas remain possible but are not current priorities:
 
 - persistently prepacking batched LSTM weights removes only a small subset of
   the remaining concat work;
 - precomputing Snake reciprocals removes less than 1 ms of measured setup;
-- moving the ~1 ms iSTFT to a graph is possible with fixed DFT matrices and
-  overlap-add, but is complex relative to its Amdahl ceiling;
-- moving harmonic generation to the GPU does not improve the current fixture
-  while its CPU work is fully hidden.
+- moving the ~1 ms iSTFT to a graph was measured (fixed DFT + `col2im_1d` OLA):
+  numerically fine but flat/noisy on this fixture; not retained;
+- moving harmonic generation to the GPU was measured across short/baseline/
+  punctuation/long: wait is material on longer fixtures, but the least-complex
+  existing-op split does not beat overlapped CPU har on this single-queue RADV
+  path; not retained.
 
 Meaningful next steps probably require one of:
 
@@ -660,8 +1201,15 @@ Meaningful next steps probably require one of:
 2. safe concurrent GPU queues for independent F0/noise and text-encoder work;
 3. multi-utterance batching for throughput rather than single-utterance
    latency;
-4. a portable device-side harmonic/iSTFT region when CPU overlap is
-   insufficient for longer workloads.
+4. a fused/portable device-side harmonic/iSTFT region only when longer or
+   batched workloads make CPU overlap insufficient — existing-op prototypes
+   for both were measured and rejected for single-utterance RADV latency.
+
+The follow-up audit above adds useful no-kernel work before those larger steps,
+but—with the exception of RADV queue selection—its estimated gains are mostly
+in the sub-2-ms range. It does not change the conclusion that a materially
+larger recurrent improvement requires backend/kernel support or a different
+throughput-oriented scheduling objective.
 
 ## Long-text duration parity finding
 
@@ -728,31 +1276,48 @@ metric implementation as WAV comparison.
 
 ### Phase D — remove avoidable host round-trips
 
-- Done: keep BERT output device-resident into the predictor where shape
-  permits (combined BERT + duration-predictor graph; only `dur_enc_out` and
-  `durations_pre` cross to the host before the dynamic-duration barrier).
-- Read only the small duration vector.
-- Done: build alignment index tensors on the host and execute alignment as
-  device gathers for duration and text encodings (`ggml_get_rows`).
-- Keep predictor/text-encoder outputs device-resident across scheduler resets
-  so compact encodings are not downloaded only to be re-uploaded.
-- Keep F0/noise tensors resident for the decoder while downloading only the F0
-  data required by the current CPU harmonic generator.
-- Done (Vulkan): overlap CPU harmonic generation with TextEncoder + Decoder
-  after hosting `m_source` weights; join before the generator.
-- Connect decoder output directly to the generator.
+Completed on the current tree:
 
-Each merge should remove one boundary and retain the previous path as a
-reference until parity is established.
+- Keep BERT output device-resident into the predictor where shape permits
+  (combined BERT + duration-predictor graph; only `dur_enc_out` and
+  `durations_pre` cross to the host before the dynamic-duration barrier).
+- Build alignment index tensors on the host and execute alignment as device
+  gathers for duration and text encodings (`ggml_get_rows`).
+- Overlap CPU harmonic generation with TextEncoder + Decoder on Vulkan after
+  hosting `m_source` weights; join before the generator.
+
+Measured and **deprioritized** on this RADV single-utterance fixture (see
+follow-up audit / explored-approaches table; not immediate open work):
+
+- Persistent boundary tensors / keeping predictor–text–F0 encodings resident
+  across the five-stage shared scheduler: transfer slice is only ~0.9 ms;
+  host lifecycle is dominated by structural `split_graph` in `reset_alloc`.
+- Connecting decoder output directly to the generator / one large
+  post-duration graph: previously measured flat/slightly slower; transfers
+  are not the dominant cost at these compact boundaries.
+- Per-stage schedulers / reserve-driven reuse: cold path regressed; warm path
+  flat/noisy with only a partial `reset_alloc` reduction.
 
 ### Phase E — enlarge the native compute region
 
-- Implement harmonic generation with portable GGML operations or a justified
-  native backend operation.
-- Implement and validate device iSTFT.
-- Merge compatible stage graphs and reuse scheduler allocations.
-- Reduce submissions and synchronisation only after stage-level correctness is
-  stable.
+Measured and **rejected / deprioritized** on this fixture (not immediate open
+work; revisit only under the stated conditions):
+
+- Existing-op device harmonic: real unhidden wait on punctuation/long, but
+  same-queue device path regresses baseline and only yields a noisy ~2 ms
+  long-fixture paired median. Revisit with a second queue, fused device
+  RNG/STFT (`atan2`), or long/batched throughput.
+- Device iSTFT via existing GGML ops: near-parity, flat/noisy ~1 ms ceiling.
+  Revisit only with a fused kernel or long/batched device-resident need.
+- Per-stage scheduler reuse / larger graph-cache work: not justified by the
+  ~6 ms host lifecycle ceiling measured above.
+
+Still dependent on backend/kernel capability rather than application-only
+rewrites:
+
+- a native/fused recurrent LSTM timestep or sequence scan;
+- safe concurrent GPU queues for independent F0/noise and text-encoder work;
+- multi-utterance batching for throughput rather than single-utterance latency.
 
 ## Definition of “GPU support works properly”
 

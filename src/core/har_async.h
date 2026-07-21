@@ -18,6 +18,11 @@ struct ComputeResult {
     float* data = nullptr;
     int T_har = 0;
     double work_ms = 0.0;
+    // Optional KOKORO_BENCH CPU subphase times collected on the worker.
+    // Reported only on the caller thread after join (never via the log
+    // callback from the harmonic worker).
+    enum { kPhaseCount = 6 };
+    double phase_ms[kPhaseCount] = {};
 };
 
 // Joins a future<ComputeResult> and frees the malloc'd payload unless released.
@@ -98,6 +103,8 @@ struct AsyncResult {
         local.data = nullptr;
         local.T_har = 0;
         local.work_ms = 0.0;
+        for (int i = 0; i < ComputeResult::kPhaseCount; i++)
+            local.phase_ms[i] = 0.0;
     }
 };
 

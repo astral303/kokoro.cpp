@@ -185,13 +185,32 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Synthesize
+    // Synthesize. Optional in-process repeats for lifecycle/reuse benches:
+    // KOKORO_BENCH_ITERS=N requires KOKORO_BENCH=1 so normal CLI runs stay
+    // single-shot unless profiling is explicitly enabled.
+    int bench_iters = 1;
+    if (const char *bench_env = getenv("KOKORO_BENCH");
+        bench_env && *bench_env && *bench_env != '0') {
+        if (const char *iters_env = getenv("KOKORO_BENCH_ITERS")) {
+            const int parsed = atoi(iters_env);
+            if (parsed > 1)
+                bench_iters = parsed;
+        }
+    }
+
     struct kokoro_audio audio = {};
-    enum kokoro_status status;
-    if (use_phonemes) {
-        status = kokoro_synthesize_phonemes_audio(ctx, text, &audio);
-    } else {
-        status = kokoro_synthesize_audio(ctx, text, &audio);
+    enum kokoro_status status = KOKORO_STATUS_OK;
+    for (int iter = 0; iter < bench_iters; iter++) {
+        if (iter > 0)
+            kokoro_audio_free(&audio);
+        audio = {};
+        if (use_phonemes) {
+            status = kokoro_synthesize_phonemes_audio(ctx, text, &audio);
+        } else {
+            status = kokoro_synthesize_audio(ctx, text, &audio);
+        }
+        if (status != KOKORO_STATUS_OK)
+            break;
     }
 
     if (status != KOKORO_STATUS_OK) {

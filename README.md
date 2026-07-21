@@ -262,7 +262,8 @@ for the tested revision.
 | Variable | Description |
 |----------|-------------|
 | `KOKORO_ESPEAK_DATA_PATH` | Override espeak-ng data directory |
-| `KOKORO_BENCH=1` | Print per-stage timing to log |
+| `KOKORO_BENCH=1` | Print per-stage timing to log. Also emits GPU lifecycle subphases (`stage.graph_build` / `.reset_alloc` / `.upload` / `.compute` / `.download` / `.host`) and CPU harmonic subphases (`har_phase.*`). Harmonic phase times are collected on the worker and logged only after join on the caller thread. |
+| `KOKORO_BENCH_ITERS=N` | CLI only: repeat synthesis N times in-process (requires `KOKORO_BENCH=1`; last WAV is written) |
 | `KOKORO_SEED=N` | Fix RNG seed for reproducible output |
 | `KOKORO_FASTCONV=0` | Disable FASTCONV kernel optimisation |
 | `KOKORO_HAR_OVERLAP=0` | Disable Vulkan harmonic/GPU overlap for A/B testing |
@@ -270,6 +271,16 @@ for the tested revision.
 | `KOKORO_DEBUG_DURATIONS=1` | Log raw and rounded token durations via the Kokoro callback |
 | `KOKORO_GGUF_MMAP=0` | Disable mmap for model loading |
 | `KOKORO_MLOCK=1` | Lock model pages in memory |
+
+GGML backend environment variables are not Kokoro options. In particular,
+`GGML_VK_ALLOW_GRAPHICS_QUEUE` is a runtime, presence-based GGML Vulkan control
+(`=0` still enables it). A standalone host may set it before the first GGML
+Vulkan registration/device query to opt into the measured RADV queue path.
+Kokoro never sets it because an embedding process may share one external GGML
+instance with other models. The linked external GGML revision must implement
+the variable; older/forked implementations may silently ignore it. See
+[GPU_OPTIMIZATION.md](GPU_OPTIMIZATION.md#radv-graphics-capable-queue-selection--confirmed-improvement)
+for compatibility, timing, and benchmark details.
 
 ## License
 
