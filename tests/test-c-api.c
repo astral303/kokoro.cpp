@@ -11,11 +11,18 @@ int main(void) {
     if (strcmp(params.espeak_lang, "en-us") != 0) {
         return 2;
     }
-    if (kokoro_version() == NULL || kokoro_last_error() == NULL) {
+    if (params.backend != KOKORO_BACKEND_AUTO || params.device != 0) {
         return 3;
+    }
+    if (kokoro_version() == NULL || kokoro_last_error() == NULL) {
+        return 4;
+    }
+    if (kokoro_get_backend(NULL) != KOKORO_BACKEND_AUTO ||
+        kokoro_backend_name(NULL) != NULL) {
+        return 5;
     }
 
     struct kokoro_audio audio = {0};
     kokoro_audio_free(&audio);
-    return audio.samples == NULL && audio.n_samples == 0 ? 0 : 4;
+    return audio.samples == NULL && audio.n_samples == 0 ? 0 : 6;
 }

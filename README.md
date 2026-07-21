@@ -2,10 +2,10 @@
 
 Standalone C/C++ inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) text-to-speech, powered by [ggml](https://github.com/ggml-org/ggml).
 
-- **CPU-only** — no GPU required
+- **CPU and GPU** — CPU fallback plus Vulkan, Metal, and CUDA backends
 - **C ABI** — suitable for cgo, FFI, Python ctypes, Rust bindgen
 - **24 kHz mono** — non-autoregressive, full-utterance synthesis
-- **Minimal dependencies** — pinned ggml submodule + espeak-ng (system)
+- **Minimal CPU dependencies** — pinned ggml submodule + espeak-ng (system)
 
 ## Quick Start
 
@@ -19,6 +19,7 @@ git submodule update --init
 # Build
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
+# Add -DKOKORO_VULKAN=OFF for a CPU-only Linux build.
 cmake --build . -j$(nproc)
 
 # Download model (f16 default; pass q8_0 for quantised)
@@ -38,6 +39,8 @@ cmake --build . -j$(nproc)
 #include "kokoro.h"
 
 struct kokoro_context_params params = kokoro_context_default_params();
+params.backend = KOKORO_BACKEND_AUTO; // or CPU, VULKAN, METAL, CUDA
+params.device = 0;
 struct kokoro_context *ctx = kokoro_init_from_file("model.gguf", params);
 kokoro_load_voice_pack(ctx, "voice.gguf");
 
@@ -83,6 +86,9 @@ void my_log(enum kokoro_log_level level, const char *msg, void *ud) {
 kokoro_log_set(my_log, NULL);
 ```
 
+Logging is disabled by default. Library and GGML diagnostics are delivered only
+through the callback; the library never writes directly to stdout or stderr.
+
 ## API Design Notes
 
 | Feature | API | Notes |
@@ -92,6 +98,7 @@ kokoro_log_set(my_log, NULL);
 | Build identity | `kokoro_version()` | Returns "kokoro.cpp 0.1.0 (hash)" |
 | Errors | `kokoro_last_error()` | Thread-local, errno-style |
 | Logging | `kokoro_log_set(cb, ud)` | Process-wide, thread-safe install |
+| Backend | `kokoro_get_backend/name` | Reports the backend selected for a context |
 | Audio output | `struct kokoro_audio` | POD; freed with `kokoro_audio_free` |
 | Voice query | `kokoro_voice_name/max_phonemes` | After voice pack load |
 | Thread safety | Context is NOT thread-safe | One context per thread, or serialise |
@@ -127,6 +134,11 @@ Download either verified model with:
 `f16` is the quality/reference default. `q8_0` is smaller and has been
 validated for loading and synthesis, but this project has not yet published
 an objective quality comparison between them.
+
+Both models have also been synthesized through Vulkan on an AMD Radeon RX 7900
+XTX. Fixed-seed CPU and Vulkan output had identical duration and transcription
+but was not PCM-identical, as expected from backend-specific floating-point
+execution.
 
 ### Published voice packs
 
@@ -201,7 +213,16 @@ ctest  # run model-free tests
 | `KOKORO_BUILD_TESTS` | ON standalone, OFF as subproject | Build and register tests |
 | `KOKORO_STATIC` | ON | Static library (propagates KOKORO_STATIC) |
 | `KOKORO_WERROR` | OFF | Treat warnings in kokoro.cpp sources as errors |
+| `KOKORO_VULKAN` | ON except Apple | Build the Vulkan backend |
+| `KOKORO_METAL` | ON on Apple | Build the Metal backend |
+| `KOKORO_CUDA` | OFF | Build the CUDA backend |
 | `KOKORO_GGML_DIR` | bundled `ggml/` | Use a compatible external ggml source checkout |
+
+At runtime, `KOKORO_BACKEND_AUTO` tries Metal, CUDA, Vulkan, then CPU among the
+compiled backends. An explicitly requested unavailable backend is an error.
+The CLI exposes the same selection through `--backend` and `--device`.
+Vulkan builds require the Vulkan loader, headers, and a shader compiler
+(`glslc` or `glslangValidator`); CUDA builds require the CUDA toolkit.
 
 ### Embedding and external ggml
 

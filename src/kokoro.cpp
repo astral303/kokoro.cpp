@@ -23,7 +23,8 @@
 //   iSTFT on CPU (n_fft=20, hop=5, Hann) → 24 kHz audio
 //
 // The implementation loads GGUF model and voice weights, phonemizes text,
-// executes each inference stage on ggml's CPU backend, and reconstructs PCM.
+// executes each inference stage through ggml's backend scheduler, and
+// reconstructs PCM.
 
 #include "kokoro.h"
 #include "phoneme_utils.h"
@@ -36,11 +37,21 @@
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
 #include "core/kokoro_env.h"
+#include "core/log.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+#ifdef KOKORO_HAS_VULKAN
+#include "ggml-vulkan.h"
+#endif
+#ifdef KOKORO_HAS_METAL
+#include "ggml-metal.h"
+#endif
+#ifdef KOKORO_HAS_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -69,13 +80,17 @@
 static std::mutex g_log_mutex;
 static kokoro_log_cb g_log_cb = nullptr;
 static void* g_log_ud = nullptr;
+static std::once_flag g_ggml_log_once;
 
-static void kokoro_log(enum kokoro_log_level level, const char* fmt, ...) {
+void kokoro_log_internal(enum kokoro_log_level level, const char* fmt, ...) {
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    size_t len = std::strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+        buf[--len] = '\0';
 
     kokoro_log_cb cb;
     void* user_data;
@@ -86,9 +101,30 @@ static void kokoro_log(enum kokoro_log_level level, const char* fmt, ...) {
     }
     if (cb) {
         cb(level, buf, user_data);
-    } else {
-        std::fprintf(stderr, "%s\n", buf);
     }
+}
+
+#define kokoro_log kokoro_log_internal
+
+static void kokoro_ggml_log(enum ggml_log_level level, const char* text, void*) {
+    enum kokoro_log_level mapped = KOKORO_LOG_INFO;
+    switch (level) {
+    case GGML_LOG_LEVEL_DEBUG: mapped = KOKORO_LOG_DEBUG; break;
+    case GGML_LOG_LEVEL_WARN:  mapped = KOKORO_LOG_WARN;  break;
+    case GGML_LOG_LEVEL_ERROR: mapped = KOKORO_LOG_ERROR; break;
+    case GGML_LOG_LEVEL_NONE:
+    case GGML_LOG_LEVEL_INFO:
+    case GGML_LOG_LEVEL_CONT:  break;
+    }
+    kokoro_log_internal(mapped, "%s", text ? text : "");
+}
+
+static void kokoro_install_ggml_log_adapter(void) {
+    std::call_once(g_ggml_log_once, [] {
+        // GGML otherwise installs a stderr logger. Route its diagnostics
+        // through the same host-controlled callback as kokoro.cpp.
+        ggml_log_set(kokoro_ggml_log, nullptr);
+    });
 }
 
 // ===========================================================================
@@ -249,9 +285,10 @@ struct kokoro_context {
     kokoro_hp hp;
     kokoro_vocab vocab;
 
-    // CPU backend used for weights and graph execution.
+    // Primary compute backend plus CPU fallback for unsupported operations.
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    enum kokoro_backend selected_backend = KOKORO_BACKEND_CPU;
 
     // Scheduler for all graph compute.
     ggml_backend_sched_t sched = nullptr;
@@ -2178,6 +2215,8 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     p.n_threads = 4;
     p.verbosity = 1;
     p.length_scale = 1.0f;
+    p.backend = KOKORO_BACKEND_AUTO;
+    p.device = 0;
     std::strncpy(p.espeak_lang, "en-us", sizeof(p.espeak_lang) - 1);
     return p;
 }
@@ -2192,6 +2231,15 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
                         params.abi_version, KOKORO_ABI_VERSION);
         return nullptr;
     }
+    if (params.backend < KOKORO_BACKEND_AUTO || params.backend > KOKORO_BACKEND_CUDA) {
+        kokoro_set_error("invalid backend value %d", (int)params.backend);
+        return nullptr;
+    }
+    if (params.device < 0) {
+        kokoro_set_error("device must be >= 0");
+        return nullptr;
+    }
+    kokoro_install_ggml_log_adapter();
     // Match PyTorch's torch.round behaviour (banker's rounding) when the
     // runtime later applies `nearbyintf` to durations (R5 in the plan).
     // Setting this globally is benign — the only place we round is the
@@ -2290,9 +2338,83 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         return nullptr;
     }
     ggml_backend_cpu_set_n_threads(c->backend_cpu, c->n_threads);
-    c->backend = c->backend_cpu;
-    if (!c->backend)
+
+    const enum kokoro_backend requested = params.backend;
+    auto init_vulkan = [&]() -> bool {
+#ifdef KOKORO_HAS_VULKAN
+        if (params.device >= ggml_backend_vk_get_device_count())
+            return false;
+        c->backend = ggml_backend_vk_init((size_t)params.device);
+        if (c->backend)
+            c->selected_backend = KOKORO_BACKEND_VULKAN;
+        return c->backend != nullptr;
+#else
+        return false;
+#endif
+    };
+    auto init_metal = [&]() -> bool {
+#ifdef KOKORO_HAS_METAL
+        if (params.device != 0)
+            return false;
+        c->backend = ggml_backend_metal_init();
+        if (c->backend)
+            c->selected_backend = KOKORO_BACKEND_METAL;
+        return c->backend != nullptr;
+#else
+        return false;
+#endif
+    };
+    auto init_cuda = [&]() -> bool {
+#ifdef KOKORO_HAS_CUDA
+        if (params.device >= ggml_backend_cuda_get_device_count())
+            return false;
+        c->backend = ggml_backend_cuda_init(params.device);
+        if (c->backend)
+            c->selected_backend = KOKORO_BACKEND_CUDA;
+        return c->backend != nullptr;
+#else
+        return false;
+#endif
+    };
+
+    switch (requested) {
+    case KOKORO_BACKEND_AUTO:
+        if (!init_metal() && !init_cuda())
+            init_vulkan();
+        break;
+    case KOKORO_BACKEND_CPU:
+        break;
+    case KOKORO_BACKEND_VULKAN:
+        if (!init_vulkan()) {
+            kokoro_set_error("Vulkan backend unavailable or device %d is invalid", params.device);
+            kokoro_free(c);
+            return nullptr;
+        }
+        break;
+    case KOKORO_BACKEND_METAL:
+        if (!init_metal()) {
+            kokoro_set_error("Metal backend unavailable (Metal only supports device 0)");
+            kokoro_free(c);
+            return nullptr;
+        }
+        break;
+    case KOKORO_BACKEND_CUDA:
+        if (!init_cuda()) {
+            kokoro_set_error("CUDA backend unavailable or device %d is invalid", params.device);
+            kokoro_free(c);
+            return nullptr;
+        }
+        break;
+    }
+
+    if (!c->backend) {
         c->backend = c->backend_cpu;
+        c->selected_backend = KOKORO_BACKEND_CPU;
+    }
+
+    if (params.verbosity >= 1)
+        kokoro_log(KOKORO_LOG_INFO, "kokoro: backend=%s device=%d",
+                   ggml_backend_name(c->backend), params.device);
 
     // ---- Pass 2: weights ----
     core_gguf::WeightLoad wl;
@@ -2487,7 +2609,7 @@ extern "C" int32_t* kokoro_phonemes_to_ids(struct kokoro_context* ctx, const cha
     // matching token first (combining marks like ̃ or ː are 2 bytes and
     // attach to the previous letter, so they tokenise as their own ids
     // when they appear standalone). Unknown codepoints emit pad_id and a
-    // stderr warning.
+    // callback warning.
     std::vector<int32_t> ids;
     ids.reserve(std::strlen(phonemes));
 
@@ -2773,6 +2895,23 @@ extern "C" void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads) 
     ctx->n_threads = n_threads;
     if (ctx->backend_cpu)
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
+}
+
+extern "C" enum kokoro_backend kokoro_get_backend(const struct kokoro_context* ctx) {
+    return ctx ? ctx->selected_backend : KOKORO_BACKEND_AUTO;
+}
+
+extern "C" const char* kokoro_backend_name(const struct kokoro_context* ctx) {
+    if (!ctx)
+        return nullptr;
+    switch (ctx->selected_backend) {
+    case KOKORO_BACKEND_CPU:    return "CPU";
+    case KOKORO_BACKEND_VULKAN: return "Vulkan";
+    case KOKORO_BACKEND_METAL:  return "Metal";
+    case KOKORO_BACKEND_CUDA:   return "CUDA";
+    case KOKORO_BACKEND_AUTO:   break;
+    }
+    return "unknown";
 }
 
 // The duration-predictor output is scaled before rounding and clamping.

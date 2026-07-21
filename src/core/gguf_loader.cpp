@@ -2,6 +2,7 @@
 // See gguf_loader.h for the interface contract.
 
 #include "gguf_loader.h"
+#include "log.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
@@ -41,7 +42,7 @@ gguf_context* open_metadata(const char* path) {
     gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/nullptr};
     gguf_context* g = gguf_init_from_file(path, gp);
     if (!g) {
-        fprintf(stderr, "core_gguf: failed to open '%s' for metadata read\n", path);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "core_gguf: failed to open '%s' for metadata read\n", path);
     }
     return g;
 }
@@ -436,7 +437,7 @@ static bool mlock_enabled() {
 static void try_mlock(const char* tag, void* base, size_t size) {
 #if !defined(_WIN32)
     if (::mlock(base, size) != 0) {
-        fprintf(stderr,
+        kokoro_log_internal(KOKORO_LOG_ERROR,
                 "%s: mlock(%zu MiB) failed (errno=%d) — pages may still be evicted under "
                 "memory pressure. Raise RLIMIT_MEMLOCK (`ulimit -l unlimited`) if you want "
                 "the pin to take effect.\n",
@@ -459,7 +460,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
     gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&source_ctx};
     gguf_context* gctx = gguf_init_from_file(path, gp);
     if (!gctx || !source_ctx) {
-        fprintf(stderr, "%s: failed to load tensor metadata from '%s'\n", tag, path);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to load tensor metadata from '%s'\n", tag, path);
         if (gctx)
             gguf_free(gctx);
         if (source_ctx)
@@ -474,7 +475,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                 n_selected++;
         }
         if (n_selected == 0) {
-            fprintf(stderr, "%s: tensor filter selected no weights from '%s'\n", tag, path);
+            kokoro_log_internal(KOKORO_LOG_ERROR, "%s: tensor filter selected no weights from '%s'\n", tag, path);
             gguf_free(gctx);
             ggml_free(source_ctx);
             return false;
@@ -482,7 +483,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
 
         const size_t tensor_overhead = ggml_tensor_overhead();
         if (tensor_overhead != 0 && n_selected > (std::numeric_limits<size_t>::max() - 1024) / tensor_overhead) {
-            fprintf(stderr, "%s: filtered tensor metadata size overflow\n", tag);
+            kokoro_log_internal(KOKORO_LOG_ERROR, "%s: filtered tensor metadata size overflow\n", tag);
             gguf_free(gctx);
             ggml_free(source_ctx);
             return false;
@@ -494,7 +495,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
         };
         out.ctx = ggml_init(fp);
         if (!out.ctx) {
-            fprintf(stderr, "%s: failed to create filtered tensor context\n", tag);
+            kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to create filtered tensor context\n", tag);
             gguf_free(gctx);
             ggml_free(source_ctx);
             return false;
@@ -504,7 +505,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                 continue;
             ggml_tensor* selected = ggml_dup_tensor(out.ctx, t);
             if (!selected) {
-                fprintf(stderr, "%s: failed to duplicate filtered tensor metadata for '%s'\n", tag, ggml_get_name(t));
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to duplicate filtered tensor metadata for '%s'\n", tag, ggml_get_name(t));
                 gguf_free(gctx);
                 ggml_free(source_ctx);
                 ggml_free(out.ctx);
@@ -531,7 +532,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
             const size_t data_off = gguf_get_data_offset(gctx);
             const size_t mmap_size = mf.size;
             if (data_off > mmap_size) {
-                fprintf(stderr, "%s: GGUF data offset %zu exceeds file size %zu - file truncated?\n", tag, data_off,
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: GGUF data offset %zu exceeds file size %zu - file truncated?\n", tag, data_off,
                         mmap_size);
                 gguf_free(gctx);
                 ggml_free(out.ctx);
@@ -567,7 +568,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
 
             out.buf = ggml_backend_buffer_init(ggml_backend_cpu_buffer_type(), mmap_buffer_iface, mctx, buf_size);
             if (!out.buf) {
-                fprintf(stderr, "%s: failed to wrap mmap in backend buffer\n", tag);
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to wrap mmap in backend buffer\n", tag);
 #if defined(_WIN32)
                 UnmapViewOfFile(mctx->mmap_base);
 #else
@@ -593,7 +594,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                 const size_t off = gguf_get_tensor_offset(gctx, tid);
                 const size_t nbytes = ggml_nbytes(t);
                 if (off > buf_size || nbytes > buf_size - off) {
-                    fprintf(stderr,
+                    kokoro_log_internal(KOKORO_LOG_ERROR,
                             "%s: mmap bounds check failed for tensor '%s' "
                             "(off=%zu + nbytes=%zu > buf_size=%zu) - "
                             "falling back to legacy loader\n",
@@ -652,7 +653,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
             if (mf.ok) {
                 const size_t data_off = gguf_get_data_offset(gctx);
                 if (data_off > mf.size) {
-                    fprintf(stderr, "%s: GGUF data offset %zu exceeds file size %zu - file truncated?\n", tag, data_off,
+                    kokoro_log_internal(KOKORO_LOG_ERROR, "%s: GGUF data offset %zu exceeds file size %zu - file truncated?\n", tag, data_off,
                             mf.size);
                     gguf_free(gctx);
                     ggml_free(out.ctx);
@@ -705,7 +706,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                         const size_t nb = ggml_nbytes(t);
                         if (data_off > leaked_size || off > leaked_size - data_off ||
                             nb > leaked_size - data_off - off) {
-                            fprintf(stderr,
+                            kokoro_log_internal(KOKORO_LOG_ERROR,
                                     "%s: GPU mmap bounds check failed for tensor '%s' "
                                     "(data_off=%zu + off=%zu + nbytes=%zu > file_size=%zu) — "
                                     "falling back to legacy loader\n",
@@ -742,7 +743,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
     if (!out.buf) {
-        fprintf(stderr, "%s: failed to allocate backend buffer\n", tag);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to allocate backend buffer\n", tag);
         gguf_free(gctx);
         ggml_free(out.ctx);
         out.ctx = nullptr;
@@ -771,7 +772,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
         // models don't have to.
         FILE* fp = fopen(path, "rb");
         if (!fp) {
-            fprintf(stderr, "%s: cannot open '%s' for fread fallback\n", tag, path);
+            kokoro_log_internal(KOKORO_LOG_ERROR, "%s: cannot open '%s' for fread fallback\n", tag, path);
             gguf_free(gctx);
             ggml_backend_buffer_free(out.buf);
             out.buf = nullptr;
@@ -793,19 +794,19 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                 tbuf.resize(nbytes);
 #if defined(_WIN32)
             if (_fseeki64(fp, (int64_t)(data_off + off), SEEK_SET) != 0) {
-                fprintf(stderr, "%s: fseek failed for tensor '%s' — file truncated?\n", tag, ggml_get_name(t));
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: fseek failed for tensor '%s' — file truncated?\n", tag, ggml_get_name(t));
                 load_ok = false;
                 break;
             }
 #else
             if (fseeko(fp, (off_t)(data_off + off), SEEK_SET) != 0) {
-                fprintf(stderr, "%s: fseek failed for tensor '%s' — file truncated?\n", tag, ggml_get_name(t));
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: fseek failed for tensor '%s' — file truncated?\n", tag, ggml_get_name(t));
                 load_ok = false;
                 break;
             }
 #endif
             if (fread(tbuf.data(), 1, nbytes, fp) != nbytes) {
-                fprintf(stderr, "%s: short read for tensor '%s' (%zu bytes expected) — file truncated?\n", tag,
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: short read for tensor '%s' (%zu bytes expected) — file truncated?\n", tag,
                         ggml_get_name(t), nbytes);
                 load_ok = false;
                 break;
@@ -814,7 +815,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
         }
         fclose(fp);
         if (!load_ok) {
-            fprintf(stderr, "%s: legacy loader failed — model file may be truncated or corrupt\n", tag);
+            kokoro_log_internal(KOKORO_LOG_ERROR, "%s: legacy loader failed — model file may be truncated or corrupt\n", tag);
             gguf_free(gctx);
             ggml_backend_buffer_free(out.buf);
             out.buf = nullptr;
@@ -836,7 +837,7 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
             // additive data_off+off+nbytes wraps and passes the check. Compare
             // subtractively (each subtraction is valid once the prior guard holds).
             if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
-                fprintf(stderr,
+                kokoro_log_internal(KOKORO_LOG_ERROR,
                         "%s: mmap legacy path: tensor '%s' exceeds file bounds "
                         "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
                         tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
@@ -862,7 +863,7 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
 bool load_weights_filtered(const char* path, ggml_backend_t backend, IncludeTensor include_tensor, void* user,
                            const char* model_tag, WeightLoad& out) {
     if (!include_tensor) {
-        fprintf(stderr, "%s: load_weights_filtered requires a non-null tensor predicate\n",
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: load_weights_filtered requires a non-null tensor predicate\n",
                 model_tag ? model_tag : "core_gguf");
         return false;
     }
@@ -927,11 +928,11 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
     const char* tag = model_tag ? model_tag : "core_gguf";
 
     if (!gpu_backend || !cpu_backend) {
-        fprintf(stderr, "%s: load_weights_split requires both gpu and cpu backends\n", tag);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: load_weights_split requires both gpu and cpu backends\n", tag);
         return false;
     }
     if (!is_gpu) {
-        fprintf(stderr, "%s: load_weights_split requires a non-null is_gpu predicate\n", tag);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: load_weights_split requires a non-null is_gpu predicate\n", tag);
         return false;
     }
 
@@ -939,7 +940,7 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
     gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&out.ctx};
     gguf_context* gctx = gguf_init_from_file(path, gp);
     if (!gctx || !out.ctx) {
-        fprintf(stderr, "%s: failed to load tensor metadata from '%s'\n", tag, path);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to load tensor metadata from '%s'\n", tag, path);
         if (gctx)
             gguf_free(gctx);
         return false;
@@ -1002,7 +1003,7 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
         for (auto& chunk : chunks) {
             ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(be, chunk.aligned_total);
             if (!buf) {
-                fprintf(stderr, "%s: failed to allocate %zu MiB backend buffer\n", tag, chunk.aligned_total / 1048576);
+                kokoro_log_internal(KOKORO_LOG_ERROR, "%s: failed to allocate %zu MiB backend buffer\n", tag, chunk.aligned_total / 1048576);
                 for (auto* b : out_bufs)
                     ggml_backend_buffer_free(b);
                 out_bufs.clear();
@@ -1055,7 +1056,7 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
     if (!mf.ok) {
         FILE* fp = fopen(path, "rb");
         if (!fp) {
-            fprintf(stderr, "%s: cannot open '%s' for fread fallback\n", tag, path);
+            kokoro_log_internal(KOKORO_LOG_ERROR, "%s: cannot open '%s' for fread fallback\n", tag, path);
             free_weights(out);
             gguf_free(gctx);
             return false;
@@ -1098,7 +1099,7 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
             // additive data_off+off+nbytes wraps and passes the check. Compare
             // subtractively (each subtraction is valid once the prior guard holds).
             if (data_off > mf.size || off > mf.size - data_off || nbytes > mf.size - data_off - off) {
-                fprintf(stderr,
+                kokoro_log_internal(KOKORO_LOG_ERROR,
                         "%s: split mmap path: tensor '%s' exceeds file bounds "
                         "(off=%zu + nbytes=%zu > file_size=%zu) — file truncated?\n",
                         tag, ggml_get_name(t), data_off + off, nbytes, mf.size);
@@ -1110,8 +1111,9 @@ bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backe
         }
     }
 
-    fprintf(stderr, "%s: weight residency: gpu=%zu MiB (%zu tensors), cpu=%zu MiB (%zu tensors)\n", tag,
-            gpu_size / 1048576, gpu_tensors.size(), cpu_size / 1048576, cpu_tensors.size());
+    kokoro_log_internal(KOKORO_LOG_INFO,
+                        "%s: weight residency: gpu=%zu MiB (%zu tensors), cpu=%zu MiB (%zu tensors)\n", tag,
+                        gpu_size / 1048576, gpu_tensors.size(), cpu_size / 1048576, cpu_tensors.size());
 
     gguf_free(gctx);
     return true;
@@ -1167,7 +1169,7 @@ ggml_tensor* try_get(const tensor_map& tensors, const char* name) {
 ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag) {
     auto it = tensors.find(name);
     if (it == tensors.end()) {
-        fprintf(stderr, "%s: required tensor '%s' not found in GGUF\n", model_tag ? model_tag : "core_gguf", name);
+        kokoro_log_internal(KOKORO_LOG_ERROR, "%s: required tensor '%s' not found in GGUF\n", model_tag ? model_tag : "core_gguf", name);
         return nullptr;
     }
     return it->second;

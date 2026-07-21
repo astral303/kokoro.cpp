@@ -50,7 +50,7 @@ extern "C" {
 // Incremented when public POD layouts change. Callers should use
 // kokoro_context_default_params(), which sets this field. The library rejects
 // parameter structs whose version does not exactly match.
-#define KOKORO_ABI_VERSION 1
+#define KOKORO_ABI_VERSION 2
 
 // ---------------------------------------------------------------------------
 // Version / build identity
@@ -91,7 +91,8 @@ enum kokoro_log_level {
 // Callback signature. msg has no trailing newline. Must be reentrant.
 typedef void (*kokoro_log_cb)(enum kokoro_log_level level, const char * msg, void * user_data);
 
-// Install a process-wide log callback. NULL restores default (stderr).
+// Install a process-wide log callback for kokoro.cpp and GGML diagnostics.
+// NULL disables library logging; the library never writes directly to stderr.
 // Thread-safe install; takes effect on subsequent log delivery. The caller
 // must keep cb and user_data valid while synthesis may still be running.
 KOKORO_API void kokoro_log_set(kokoro_log_cb cb, void * user_data);
@@ -102,12 +103,22 @@ KOKORO_API void kokoro_log_set(kokoro_log_cb cb, void * user_data);
 
 struct kokoro_context;
 
+enum kokoro_backend {
+    KOKORO_BACKEND_AUTO    = 0, // Metal, CUDA, or Vulkan if available; otherwise CPU
+    KOKORO_BACKEND_CPU     = 1,
+    KOKORO_BACKEND_VULKAN  = 2,
+    KOKORO_BACKEND_METAL   = 3,
+    KOKORO_BACKEND_CUDA    = 4,
+};
+
 struct kokoro_context_params {
     int   abi_version;      // must be KOKORO_ABI_VERSION
     int   n_threads;
     int   verbosity;        // 0=silent, 1=normal, 2=verbose
     float length_scale;     // duration multiplier: 1.0=default, >1=slower, <1=faster
     char  espeak_lang[32];  // espeak-ng voice, default "en-us"
+    enum kokoro_backend backend;
+    int   device;           // zero-based GPU device; ignored by CPU and Metal
 };
 
 KOKORO_API struct kokoro_context_params kokoro_context_default_params(void);
@@ -119,6 +130,12 @@ KOKORO_API struct kokoro_context * kokoro_init_from_file(const char * path_model
 KOKORO_API void kokoro_free(struct kokoro_context * ctx);
 
 KOKORO_API void kokoro_set_n_threads(struct kokoro_context * ctx, int n_threads);
+
+// Actual selected backend (AUTO is never returned for a valid context).
+KOKORO_API enum kokoro_backend kokoro_get_backend(const struct kokoro_context * ctx);
+
+// Human-readable selected backend name, or NULL for a null context.
+KOKORO_API const char * kokoro_backend_name(const struct kokoro_context * ctx);
 
 // Runtime length-scale. Clamped to [0.25, 4.0].
 KOKORO_API void kokoro_set_length_scale(struct kokoro_context * ctx, float scale);

@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "log.h"
+
 #include "ggml-backend.h"
 #include "ggml.h"
 
@@ -53,7 +55,7 @@ namespace core_attn {
 // Default returns `GGML_TYPE_F16` so any backend that calls this in
 // its `*_kv_init` is bit-identical to legacy behaviour until the user
 // opts in. Recognised values: `f16` (default), `q8_0`, `q4_0`. Anything
-// else logs a warning to stderr and falls back to F16.
+// else emits a callback warning and falls back to F16.
 //
 // Pairs with the `core_attn::kv_self_attn` write- and read-path
 // quant-safety: when the cache type is quantised, the helper switches
@@ -76,7 +78,8 @@ inline ggml_type kv_dtype_parse(const char* s, const char* backend_tag, const ch
         return GGML_TYPE_Q8_0;
     if (std::strcmp(s, "q4_0") == 0 || std::strcmp(s, "Q4_0") == 0)
         return GGML_TYPE_Q4_0;
-    std::fprintf(stderr, "%s: %s='%s' unrecognised, defaulting to f16\n", backend_tag, env_name, s);
+    kokoro_log_internal(KOKORO_LOG_WARN, "%s: %s='%s' unrecognised, defaulting to f16",
+                        backend_tag, env_name, s);
     return GGML_TYPE_F16;
 }
 
@@ -128,8 +131,9 @@ inline ggml_backend_t kv_backend_from_env(ggml_backend_t gpu_backend, ggml_backe
     if (!s || !*s || std::strcmp(s, "0") == 0)
         return gpu_backend;
     if (!cpu_backend) {
-        std::fprintf(stderr, "%s: KOKORO_KV_ON_CPU=%s requested but no CPU backend available, falling back to GPU\n",
-                     backend_tag, s);
+        kokoro_log_internal(KOKORO_LOG_WARN,
+                            "%s: KOKORO_KV_ON_CPU=%s requested but no CPU backend available, falling back to GPU",
+                            backend_tag, s);
         return gpu_backend;
     }
     return cpu_backend;

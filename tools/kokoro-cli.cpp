@@ -80,6 +80,8 @@ static void usage(const char *prog) {
             "  -l LANG    espeak-ng language (default: en-us)\n"
             "  -t N       Number of threads (default: 4)\n"
             "  -s SCALE   Length scale (default: 1.0)\n"
+            "  --backend NAME  auto, cpu, vulkan, metal, or cuda (default: auto)\n"
+            "  --device N      Zero-based GPU device (default: 0)\n"
             "  --phonemes Input is already IPA (skip phonemizer)\n"
             "  -h         Show this help\n",
             prog);
@@ -92,8 +94,10 @@ int main(int argc, char **argv) {
     const char *language = "en-us";
     const char *text = nullptr;
     int n_threads = 4;
+    int device = 0;
     float length_scale = 1.0f;
     bool use_phonemes = false;
+    enum kokoro_backend backend = KOKORO_BACKEND_AUTO;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
@@ -108,6 +112,24 @@ int main(int argc, char **argv) {
             n_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             length_scale = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            const char *name = argv[++i];
+            if (strcmp(name, "auto") == 0) {
+                backend = KOKORO_BACKEND_AUTO;
+            } else if (strcmp(name, "cpu") == 0) {
+                backend = KOKORO_BACKEND_CPU;
+            } else if (strcmp(name, "vulkan") == 0) {
+                backend = KOKORO_BACKEND_VULKAN;
+            } else if (strcmp(name, "metal") == 0) {
+                backend = KOKORO_BACKEND_METAL;
+            } else if (strcmp(name, "cuda") == 0) {
+                backend = KOKORO_BACKEND_CUDA;
+            } else {
+                fprintf(stderr, "Unknown backend: %s\n", name);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            device = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--phonemes") == 0) {
             use_phonemes = true;
         } else if (strcmp(argv[i], "-h") == 0 ||
@@ -133,13 +155,16 @@ int main(int argc, char **argv) {
     struct kokoro_context_params params = kokoro_context_default_params();
     params.n_threads = n_threads;
     params.length_scale = length_scale;
+    params.backend = backend;
+    params.device = device;
     strncpy(params.espeak_lang, language, sizeof(params.espeak_lang) - 1);
 
     struct kokoro_context *ctx = kokoro_init_from_file(model_path, params);
     if (!ctx) {
-        fprintf(stderr, "Failed to load model: %s\n", model_path);
+        fprintf(stderr, "Failed to load model: %s\n", kokoro_last_error());
         return 1;
     }
+    fprintf(stderr, "Using %s backend\n", kokoro_backend_name(ctx));
 
     if (kokoro_load_voice_pack(ctx, voice_path) != 0) {
         fprintf(stderr, "Failed to load voice pack: %s\n", voice_path);

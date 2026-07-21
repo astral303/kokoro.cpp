@@ -65,7 +65,7 @@ namespace core_gguf {
 
 // Open the GGUF for metadata-only reading. Returns a gguf_context owned
 // by the caller — free with free_metadata() when done reading keys.
-// Returns nullptr and prints an error to stderr on failure.
+// Returns nullptr and emits a callback diagnostic on failure.
 gguf_context* open_metadata(const char* path);
 
 // Free a gguf_context obtained from open_metadata().
@@ -154,8 +154,8 @@ bool load_weights_filtered(const char* path, ggml_backend_t backend, IncludeTens
 // who set N_GPU_LAYERS are accepting the extra RAM hit to fit the
 // model at all.
 //
-// Returns false on any allocation / load failure with a logged
-// stderr message; partial state is freed before returning.
+// Returns false on any allocation / load failure with a callback
+// diagnostic; partial state is freed before returning.
 using IsGpuTensor = bool (*)(const char* tensor_name, void* user);
 bool load_weights_split(const char* path, ggml_backend_t gpu_backend, ggml_backend_t cpu_backend, IsGpuTensor is_gpu,
                         void* user, const char* model_tag, WeightLoad& out);
@@ -213,7 +213,7 @@ void mmap_advise_random(ggml_backend_buffer_t buf);
 // tracks the per-repo map choice automatically.
 ggml_tensor* try_get(const tensor_map& tensors, const char* name);
 
-// Look up a tensor by name. Prints an error to stderr if missing but
+// Look up a tensor by name. Emits a callback diagnostic if missing but
 // still returns nullptr — the caller decides whether a missing tensor
 // is fatal.
 ggml_tensor* require(const tensor_map& tensors, const char* name, const char* model_tag);

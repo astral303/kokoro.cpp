@@ -28,6 +28,8 @@ static void test_default_params() {
     CHECK(p.length_scale == 1.0f);
     CHECK(p.verbosity == 1);
     CHECK(std::strcmp(p.espeak_lang, "en-us") == 0);
+    CHECK(p.backend == KOKORO_BACKEND_AUTO);
+    CHECK(p.device == 0);
 }
 
 static void test_abi_version_check() {
@@ -43,6 +45,18 @@ static void test_abi_version_check() {
     ctx = kokoro_init_from_file("dummy.gguf", p);
     CHECK(ctx == NULL);
     CHECK(std::strstr(kokoro_last_error(), "abi_version") != NULL);
+}
+
+static void test_backend_validation() {
+    struct kokoro_context_params p = kokoro_context_default_params();
+    p.backend = (enum kokoro_backend)99;
+    CHECK(kokoro_init_from_file("dummy.gguf", p) == NULL);
+    CHECK(std::strstr(kokoro_last_error(), "backend") != NULL);
+
+    p = kokoro_context_default_params();
+    p.device = -1;
+    CHECK(kokoro_init_from_file("dummy.gguf", p) == NULL);
+    CHECK(std::strstr(kokoro_last_error(), "device") != NULL);
 }
 
 static void test_null_model() {
@@ -68,6 +82,8 @@ static void test_null_guards() {
     CHECK(kokoro_sample_rate(NULL) == 0);
     CHECK(kokoro_voice_name(NULL) == NULL);
     CHECK(kokoro_voice_max_phonemes(NULL) == 0);
+    CHECK(kokoro_get_backend(NULL) == KOKORO_BACKEND_AUTO);
+    CHECK(kokoro_backend_name(NULL) == NULL);
 }
 
 static void test_audio_struct() {
@@ -109,6 +125,7 @@ int main() {
     test_version();
     test_default_params();
     test_abi_version_check();
+    test_backend_validation();
     test_null_model();
     test_missing_model();
     test_null_guards();
