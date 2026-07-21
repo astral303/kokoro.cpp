@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # Download Kokoro-82M GGUF model and default voice pack.
-# Models are hosted on Hugging Face.
+#
+# Usage:
+#   ./download-model.sh              # downloads f16 (default)
+#   ./download-model.sh q8_0         # downloads q8_0 quantisation
+#   KOKORO_QUANT=q8_0 ./download-model.sh
+#
+# Supported quantisations: f16 (default), q8_0
+# Models hosted on Hugging Face: cstr/kokoro-82m-GGUF, cstr/kokoro-voices-GGUF
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODEL_DIR="${KOKORO_MODEL_DIR:-$SCRIPT_DIR}"
 
+QUANT="${1:-${KOKORO_QUANT:-f16}}"
+case "$QUANT" in
+    f16)   MODEL_FILE="kokoro-82m-f16.gguf" ;;
+    q8_0)  MODEL_FILE="kokoro-82m-q8_0.gguf" ;;
+    *)     echo "Error: unsupported quantisation '$QUANT' (use f16 or q8_0)" >&2; exit 1 ;;
+esac
+
 HF_MODEL="https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main"
 HF_VOICES="https://huggingface.co/cstr/kokoro-voices-GGUF/resolve/main"
-MODEL_FILE="kokoro-82m-f16.gguf"
 VOICE_FILE="kokoro-voice-af_heart.gguf"
 
 download() {
@@ -37,6 +50,8 @@ download "$HF_VOICES/$VOICE_FILE" "$MODEL_DIR/$VOICE_FILE"
 
 echo ""
 echo "Done. Model files in: $MODEL_DIR"
+echo "  Model: $MODEL_FILE ($QUANT)"
+echo "  Voice: $VOICE_FILE"
 echo ""
 echo "Usage:"
 echo "  kokoro-cli -m $MODEL_DIR/$MODEL_FILE -v $MODEL_DIR/$VOICE_FILE \"Hello world\""

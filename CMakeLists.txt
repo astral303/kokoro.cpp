@@ -1,6 +1,18 @@
 cmake_minimum_required(VERSION 3.14)
 project(kokoro.cpp VERSION 0.1.0 LANGUAGES C CXX)
 
+# Generate version info
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE KOKORO_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT KOKORO_GIT_HASH)
+    set(KOKORO_GIT_HASH "unknown")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -110,7 +122,14 @@ endif()
 
 target_compile_definitions(kokoro PRIVATE
     KOKORO_BUILD
+    KOKORO_VERSION="${PROJECT_VERSION}"
+    KOKORO_GIT_HASH="${KOKORO_GIT_HASH}"
 )
+
+# Propagate KOKORO_STATIC to consumers of the static lib
+if(KOKORO_STATIC)
+    target_compile_definitions(kokoro PUBLIC KOKORO_STATIC)
+endif()
 
 # ===========================================================================
 # CLI tool
@@ -143,4 +162,9 @@ if(KOKORO_BUILD_TESTS)
         target_compile_options(test-smoke PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME smoke COMMAND test-smoke)
+
+    add_executable(test-c-api tests/test-c-api.c)
+    target_link_libraries(test-c-api PRIVATE kokoro)
+    set_target_properties(test-c-api PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME c-api COMMAND test-c-api)
 endif()

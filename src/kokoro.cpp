@@ -43,10 +43,12 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cfenv>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +61,64 @@
 #include <vector>
 
 #include <espeak-ng/speak_lib.h>
+
+// ===========================================================================
+// Logging infrastructure
+// ===========================================================================
+
+static std::mutex g_log_mutex;
+static kokoro_log_cb g_log_cb = nullptr;
+static void* g_log_ud = nullptr;
+
+static void kokoro_log(enum kokoro_log_level level, const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    kokoro_log_cb cb;
+    void* user_data;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        cb = g_log_cb;
+        user_data = g_log_ud;
+    }
+    if (cb) {
+        cb(level, buf, user_data);
+    } else {
+        std::fprintf(stderr, "%s\n", buf);
+    }
+}
+
+// ===========================================================================
+// Thread-local error state
+// ===========================================================================
+
+static thread_local std::string g_last_error;
+
+static void kokoro_set_error(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_last_error = buf;
+    kokoro_log(KOKORO_LOG_ERROR, "%s", buf);
+}
+
+// ===========================================================================
+// Version string
+// ===========================================================================
+
+#ifndef KOKORO_VERSION
+#define KOKORO_VERSION "0.1.0"
+#endif
+#ifndef KOKORO_GIT_HASH
+#define KOKORO_GIT_HASH "unknown"
+#endif
+
+static const char g_version_str[] = "kokoro.cpp " KOKORO_VERSION " (" KOKORO_GIT_HASH ")";
 
 namespace {
 
@@ -84,7 +144,7 @@ struct kokoro_bench_stage {
             return;
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::fprintf(stderr, "  kokoro_bench: %-22s %.2f ms\n", name, ms);
+        kokoro_log(KOKORO_LOG_DEBUG, "kokoro: benchmark %-22s %.2f ms", name, ms);
     }
 };
 
@@ -231,7 +291,7 @@ ggml_tensor* try_get(const kokoro_context* c, const char* name) {
 ggml_tensor* require(const kokoro_context* c, const char* name) {
     auto* t = try_get(c, name);
     if (!t) {
-        fprintf(stderr, "kokoro: required tensor missing: %s\n", name);
+        kokoro_set_error("required tensor missing: %s", name);
     }
     return t;
 }
@@ -276,7 +336,7 @@ bool sanity_check_weights(const kokoro_context* c) {
     bool ok = true;
     for (const char* name : must_have) {
         if (c->tensors.find(name) == c->tensors.end()) {
-            fprintf(stderr, "kokoro: required tensor missing: %s\n", name);
+            kokoro_set_error("required tensor missing: %s", name);
             ok = false;
         }
     }
@@ -853,7 +913,7 @@ static ggml_tensor* kokoro_voice_style_slice(ggml_context* ctx, kokoro_context* 
     if (idx < 1)
         idx = 1;
     if (idx > (int)max_phon) {
-        fprintf(stderr, "kokoro: L_raw=%d clamped to max_phon=%u for voice pack\n", L_raw, max_phon);
+        kokoro_log(KOKORO_LOG_WARN, "kokoro: phoneme count %d clamped to voice maximum %u", L_raw, max_phon);
         idx = (int)max_phon;
     }
     idx -= 1;
@@ -1972,7 +2032,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
     padded.push_back(c->vocab.pad_id);
     const int L = (int)padded.size();
     if (L > (int)c->hp.plbert_max_pos) {
-        fprintf(stderr, "kokoro: L_padded=%d exceeds max=%u\n", L, c->hp.plbert_max_pos);
+        kokoro_set_error("padded phoneme count %d exceeds model maximum %u", L, c->hp.plbert_max_pos);
         return nullptr;
     }
 
@@ -2114,6 +2174,7 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
 
 extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     kokoro_context_params p{};
+    p.abi_version = KOKORO_ABI_VERSION;
     p.n_threads = 4;
     p.verbosity = 1;
     p.length_scale = 1.0f;
@@ -2123,7 +2184,12 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
 
 extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, struct kokoro_context_params params) {
     if (!path_model) {
-        fprintf(stderr, "kokoro: null model path\n");
+        kokoro_set_error("null model path");
+        return nullptr;
+    }
+    if (params.abi_version != KOKORO_ABI_VERSION) {
+        kokoro_set_error("unsupported abi_version %d (library requires %d)",
+                        params.abi_version, KOKORO_ABI_VERSION);
         return nullptr;
     }
     // Match PyTorch's torch.round behaviour (banker's rounding) when the
@@ -2141,7 +2207,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     {
         gguf_context* g = core_gguf::open_metadata(path_model);
         if (!g) {
-            fprintf(stderr, "kokoro: failed to read GGUF '%s'\n", path_model);
+            kokoro_set_error("failed to read GGUF '%s'", path_model);
             delete c;
             return nullptr;
         }
@@ -2150,7 +2216,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         // hexgrad/Kokoro-82M and yl4579/StyleTTS2-LJSpeech.
         std::string arch = core_gguf::kv_str(g, "general.architecture", "");
         if (arch != "kokoro") {
-            fprintf(stderr, "kokoro: unexpected general.architecture='%s' (want 'kokoro')\n", arch.c_str());
+            kokoro_set_error("unexpected general.architecture='%s' (want 'kokoro')", arch.c_str());
             gguf_free(g);
             delete c;
             return nullptr;
@@ -2209,9 +2275,9 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
 
     if (params.verbosity >= 1) {
         const auto& hp = c->hp;
-        fprintf(stderr,
+        kokoro_log(KOKORO_LOG_INFO,
                 "kokoro: arch=kokoro  hidden=%u style=%u max_dur=%u n_token=%u "
-                "vocab=%zu plbert=%uL/%uH/ff=%u  iSTFT n_fft=%u hop=%u sr=%u\n",
+                "vocab=%zu plbert=%uL/%uH/ff=%u  iSTFT n_fft=%u hop=%u sr=%u",
                 hp.hidden_dim, hp.style_dim, hp.max_dur, hp.n_token, c->vocab.id_to_token.size(), hp.plbert_n_layers,
                 hp.plbert_hidden, hp.plbert_ff, hp.istft_n_fft, hp.istft_hop, hp.sample_rate);
     }
@@ -2219,7 +2285,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     // ---- Backends ----
     c->backend_cpu = ggml_backend_cpu_init();
     if (!c->backend_cpu) {
-        fprintf(stderr, "kokoro: failed to init CPU backend\n");
+        kokoro_set_error("failed to init CPU backend");
         delete c;
         return nullptr;
     }
@@ -2231,7 +2297,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     // ---- Pass 2: weights ----
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, c->backend, "kokoro", wl)) {
-        fprintf(stderr, "kokoro: failed to load weights from '%s'\n", path_model);
+        kokoro_set_error("failed to load weights from '%s'", path_model);
         kokoro_free(c);
         return nullptr;
     }
@@ -2240,7 +2306,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     c->tensors = std::move(wl.tensors);
 
     if (!sanity_check_weights(c)) {
-        fprintf(stderr, "kokoro: weight sanity check failed for '%s'\n", path_model);
+        kokoro_set_error("weight sanity check failed for '%s'", path_model);
         kokoro_free(c);
         return nullptr;
     }
@@ -2297,8 +2363,8 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
             }
         }
         if (getenv("KOKORO_FASTCONV_DEBUG"))
-            fprintf(stderr, "kokoro: FASTCONV %s: %zu F16 3D conv kernels, %d baked+swapped\n", fc_on ? "ON" : "OFF",
-                    kernels.size(), swapped);
+            kokoro_log(KOKORO_LOG_DEBUG, "kokoro: FASTCONV %s: %zu F16 3D conv kernels, %d baked+swapped",
+                       fc_on ? "ON" : "OFF", kernels.size(), swapped);
     }
 
     // ---- Schedulers ----
@@ -2314,7 +2380,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
         c->sched = ggml_backend_sched_new(backends, nullptr, n_be, /*graph_size=*/262144,
                                           /*parallel=*/false, /*op_offload=*/false);
         if (!c->sched) {
-            fprintf(stderr, "kokoro: failed to allocate main scheduler\n");
+            kokoro_set_error("failed to allocate main scheduler");
             kokoro_free(c);
             return nullptr;
         }
@@ -2323,29 +2389,30 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, 
     c->compute_meta.resize(ggml_tensor_overhead() * 262144 + ggml_graph_overhead_custom(262144, false));
 
     if (params.verbosity >= 1) {
-        fprintf(stderr, "kokoro: loaded %zu tensors from '%s'\n", c->tensors.size(), path_model);
+        kokoro_log(KOKORO_LOG_INFO, "kokoro: loaded %zu tensors from '%s'", c->tensors.size(), path_model);
     }
     return c;
 }
 
-extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* path) {
-    if (!ctx || !path)
-        return -1;
+extern "C" enum kokoro_status kokoro_load_voice_pack(struct kokoro_context* ctx, const char* path) {
+    if (!ctx || !path) {
+        kokoro_set_error("null context or path");
+        return KOKORO_STATUS_INVALID_PARAMS;
+    }
 
     // Read voice metadata: kokoro_voice.{name,max_phonemes,style_dim}.
     {
         gguf_context* g = core_gguf::open_metadata(path);
         if (!g) {
-            fprintf(stderr, "kokoro: failed to read voice pack '%s'\n", path);
-            return -1;
+            kokoro_set_error("failed to read voice pack '%s'", path);
+            return KOKORO_STATUS_LOAD_FAILED;
         }
 
         std::string arch = core_gguf::kv_str(g, "general.architecture", "");
         if (arch != "kokoro-voice") {
-            fprintf(stderr, "kokoro: voice pack '%s' has architecture='%s' (want 'kokoro-voice')\n", path,
-                    arch.c_str());
+            kokoro_set_error("voice pack '%s' has architecture='%s' (want 'kokoro-voice')", path, arch.c_str());
             gguf_free(g);
-            return -1;
+            return KOKORO_STATUS_LOAD_FAILED;
         }
 
         kokoro_voice_pack vp;
@@ -2368,16 +2435,16 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
     // during graph build.
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path, ctx->backend, "kokoro.voice", wl)) {
-        fprintf(stderr, "kokoro: failed to load voice pack tensors from '%s'\n", path);
-        return -1;
+        kokoro_set_error("failed to load voice pack tensors from '%s'", path);
+        return KOKORO_STATUS_LOAD_FAILED;
     }
 
     auto it = wl.tensors.find("voice.pack");
     if (it == wl.tensors.end() || !it->second) {
-        fprintf(stderr, "kokoro: voice pack '%s' missing 'voice.pack' tensor\n", path);
+        kokoro_set_error("voice pack '%s' missing 'voice.pack' tensor", path);
         ggml_backend_buffer_free(wl.buf);
         ggml_free(wl.ctx);
-        return -1;
+        return KOKORO_STATUS_LOAD_FAILED;
     }
 
     ggml_tensor* pack_ptr = it->second; // save before move invalidates iterator
@@ -2388,17 +2455,19 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
     ctx->vp_loaded = true;
 
     if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "kokoro: voice '%s' (max_phonemes=%u style_dim=%u) loaded from '%s'\n", ctx->vp.name.c_str(),
-                ctx->vp.max_phonemes, ctx->vp.style_dim, path);
+        kokoro_log(KOKORO_LOG_INFO, "kokoro: voice '%s' (max_phonemes=%u style_dim=%u) loaded from '%s'",
+                   ctx->vp.name.c_str(), ctx->vp.max_phonemes, ctx->vp.style_dim, path);
     }
-    return 0;
+    return KOKORO_STATUS_OK;
 }
 
-extern "C" int kokoro_set_language(struct kokoro_context* ctx, const char* espeak_lang) {
-    if (!ctx || !espeak_lang)
-        return -1;
+extern "C" enum kokoro_status kokoro_set_language(struct kokoro_context* ctx, const char* espeak_lang) {
+    if (!ctx || !espeak_lang) {
+        kokoro_set_error("null context or language");
+        return KOKORO_STATUS_INVALID_PARAMS;
+    }
     ctx->espeak_lang = espeak_lang;
-    return 0;
+    return KOKORO_STATUS_OK;
 }
 
 extern "C" void kokoro_phoneme_cache_clear(struct kokoro_context* ctx) {
@@ -2467,15 +2536,17 @@ extern "C" int32_t* kokoro_phonemes_to_ids(struct kokoro_context* ctx, const cha
             const int n = utf8_len((unsigned char)*p);
             if (ctx->params.verbosity >= 1) {
                 std::string bad(p, (size_t)n);
-                fprintf(stderr, "kokoro: unknown phoneme '%s' — skipped\n", bad.c_str());
+                kokoro_log(KOKORO_LOG_WARN, "kokoro: unknown phoneme '%s' skipped", bad.c_str());
             }
             p += n;
         }
     }
 
     int32_t* out = (int32_t*)std::malloc(ids.size() * sizeof(int32_t));
-    if (!out)
+    if (!out) {
+        kokoro_set_error("failed to allocate phoneme token buffer");
         return nullptr;
+    }
     std::memcpy(out, ids.data(), ids.size() * sizeof(int32_t));
     if (out_n)
         *out_n = (int)ids.size();
@@ -2485,8 +2556,14 @@ extern "C" int32_t* kokoro_phonemes_to_ids(struct kokoro_context* ctx, const cha
 extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const char* phonemes, int* out_n_samples) {
     if (out_n_samples)
         *out_n_samples = 0;
-    if (!ctx || !phonemes)
+    if (!ctx || !phonemes || !*phonemes) {
+        kokoro_set_error("invalid argument to kokoro_synthesize_phonemes");
         return nullptr;
+    }
+    if (!ctx->vp_loaded) {
+        kokoro_set_error("no voice pack loaded");
+        return nullptr;
+    }
 
     int n_ids = 0;
     int32_t* ids = nullptr;
@@ -2496,7 +2573,7 @@ extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const c
     }
     if (!ids || n_ids == 0) {
         std::free(ids);
-        fprintf(stderr, "kokoro: empty phoneme tokenisation for '%s'\n", phonemes);
+        kokoro_set_error("empty phoneme tokenisation for '%s'", phonemes);
         return nullptr;
     }
     int n_audio = 0;
@@ -2539,8 +2616,8 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
         int sr = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, 0, path,
                                    espeakINITIALIZE_PHONEME_IPA | espeakINITIALIZE_DONT_EXIT);
         if (sr < 0) {
-            fprintf(stderr, "kokoro: espeak_Initialize failed (data path=%s)\n",
-                    path ? path : "<default>");
+            kokoro_log(KOKORO_LOG_ERROR, "kokoro: espeak_Initialize failed (data path=%s)",
+                       path ? path : "<default>");
             g_espeak_init_failed = true;
             return false;
         }
@@ -2548,7 +2625,7 @@ bool phonemize_espeak_lib(const std::string& lang, const std::string& text, std:
     }
     if (g_espeak_voice != lang) {
         if (espeak_SetVoiceByName(lang.c_str()) != EE_OK) {
-            fprintf(stderr, "kokoro: espeak_SetVoiceByName('%s') failed\n", lang.c_str());
+            kokoro_log(KOKORO_LOG_ERROR, "kokoro: espeak_SetVoiceByName('%s') failed", lang.c_str());
             return false;
         }
         g_espeak_voice = lang;
@@ -2623,28 +2700,35 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
 extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text, int* out_n_samples) {
     if (out_n_samples)
         *out_n_samples = 0;
-    if (!ctx || !text || !*text)
+    if (!ctx || !text || !*text) {
+        kokoro_set_error("invalid argument to kokoro_synthesize");
         return nullptr;
-
-    // CJK quality warnings (one-shot per language, PLAN #56)
-    static bool warned_cmn = false, warned_ja_kanji = false;
-    if (!warned_cmn && is_cmn_lang(ctx->espeak_lang)) {
-        warned_cmn = true;
-        fprintf(stderr, "kokoro: WARNING — Mandarin tone information is lost (espeak-ng tone "
-                        "numbers stripped; the 178-symbol vocab has no tone slots). For tonal "
-                        "fidelity use a misaki-based phonemizer or a dedicated Mandarin TTS.\n");
     }
-    if (!warned_ja_kanji && (ctx->espeak_lang == "ja" || ctx->espeak_lang == "jp")) {
+    if (!ctx->vp_loaded) {
+        kokoro_set_error("no voice pack loaded");
+        return nullptr;
+    }
+
+    // Process-wide, one-shot quality warnings.
+    static std::atomic<bool> warned_cmn{false};
+    static std::atomic<bool> warned_ja_kanji{false};
+    if (is_cmn_lang(ctx->espeak_lang) && !warned_cmn.exchange(true)) {
+        kokoro_log(KOKORO_LOG_WARN,
+                   "kokoro: Mandarin tone information is lost because espeak-ng tone numbers "
+                   "are stripped and the model vocabulary has no tone slots");
+    }
+    if (!warned_ja_kanji.load() && (ctx->espeak_lang == "ja" || ctx->espeak_lang == "jp")) {
         // Check for CJK Unified Ideographs (U+4E00–U+9FFF)
         const auto* p = (const unsigned char*)text;
         while (*p) {
             if (p[0] >= 0xE4 && p[0] <= 0xE9 && p[1] && p[2]) {
                 uint32_t cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
                 if (cp >= 0x4E00 && cp <= 0x9FFF) {
-                    warned_ja_kanji = true;
-                    fprintf(stderr, "kokoro: WARNING — Japanese text contains kanji. espeak-ng's "
-                                    "kanji dictionary is incomplete; consider pre-converting to "
-                                    "hiragana for better phoneme accuracy.\n");
+                    if (!warned_ja_kanji.exchange(true)) {
+                        kokoro_log(KOKORO_LOG_WARN,
+                                   "kokoro: Japanese text contains kanji; espeak-ng's kanji "
+                                   "dictionary is incomplete");
+                    }
                     break;
                 }
                 p += 3;
@@ -2664,12 +2748,12 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
     {
         kokoro_bench_stage _b("phonemize");
         if (!phonemize_cached(ctx, ctx->espeak_lang, text, phonemes)) {
-            fprintf(stderr, "kokoro: phonemizer produced no output for '%s'\n", text);
+            kokoro_set_error("phonemizer produced no output for '%s'", text);
             return nullptr;
         }
     }
     if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "kokoro: phonemes: '%s'\n", phonemes.c_str());
+        kokoro_log(KOKORO_LOG_INFO, "kokoro: phonemes: '%s'", phonemes.c_str());
     return kokoro_synthesize_phonemes(ctx, phonemes.c_str(), out_n_samples);
 }
 
@@ -2727,4 +2811,98 @@ extern "C" void kokoro_free(struct kokoro_context* ctx) {
     if (ctx->backend_cpu)
         ggml_backend_free(ctx->backend_cpu);
     delete ctx;
+}
+
+// ---------------------------------------------------------------------------
+// New API: version, logging, error, audio struct, voice query
+// ---------------------------------------------------------------------------
+
+extern "C" const char * kokoro_version(void) {
+    return g_version_str;
+}
+
+extern "C" const char * kokoro_last_error(void) {
+    return g_last_error.c_str();
+}
+
+extern "C" void kokoro_log_set(kokoro_log_cb cb, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log_cb = cb;
+    g_log_ud = user_data;
+}
+
+extern "C" const char * kokoro_voice_name(const struct kokoro_context * ctx) {
+    if (!ctx || !ctx->vp_loaded) return NULL;
+    return ctx->vp.name.c_str();
+}
+
+extern "C" int kokoro_voice_max_phonemes(const struct kokoro_context * ctx) {
+    if (!ctx || !ctx->vp_loaded) return 0;
+    return (int)ctx->vp.max_phonemes;
+}
+
+extern "C" void kokoro_audio_free(struct kokoro_audio * audio) {
+    if (!audio) return;
+    std::free(audio->samples);
+    audio->samples = NULL;
+    audio->n_samples = 0;
+    audio->sample_rate = 0;
+    audio->channels = 0;
+}
+
+extern "C" enum kokoro_status kokoro_synthesize_audio(struct kokoro_context * ctx,
+                                                      const char * text,
+                                                      struct kokoro_audio * out) {
+    if (!ctx || !text || !*text || !out) {
+        kokoro_set_error("invalid argument to kokoro_synthesize_audio");
+        return KOKORO_STATUS_INVALID_PARAMS;
+    }
+    if (!ctx->vp_loaded) {
+        kokoro_set_error("no voice pack loaded");
+        return KOKORO_STATUS_NO_VOICE;
+    }
+    // Free any previous contents
+    kokoro_audio_free(out);
+    g_last_error.clear();
+
+    int n = 0;
+    float * pcm = kokoro_synthesize(ctx, text, &n);
+    if (!pcm || n <= 0) {
+        if (g_last_error.empty())
+            kokoro_set_error("text synthesis failed");
+        return KOKORO_STATUS_SYNTH_FAILED;
+    }
+    out->samples = pcm;
+    out->n_samples = n;
+    out->sample_rate = (int)ctx->hp.sample_rate;
+    out->channels = 1;
+    return KOKORO_STATUS_OK;
+}
+
+extern "C" enum kokoro_status kokoro_synthesize_phonemes_audio(struct kokoro_context * ctx,
+                                                               const char * phonemes,
+                                                               struct kokoro_audio * out) {
+    if (!ctx || !phonemes || !*phonemes || !out) {
+        kokoro_set_error("invalid argument to kokoro_synthesize_phonemes_audio");
+        return KOKORO_STATUS_INVALID_PARAMS;
+    }
+    if (!ctx->vp_loaded) {
+        kokoro_set_error("no voice pack loaded");
+        return KOKORO_STATUS_NO_VOICE;
+    }
+    kokoro_audio_free(out);
+    g_last_error.clear();
+
+    int n = 0;
+    float * pcm = kokoro_synthesize_phonemes(ctx, phonemes, &n);
+    if (!pcm || n <= 0) {
+        if (g_last_error.empty())
+            kokoro_set_error("phoneme synthesis failed");
+        return KOKORO_STATUS_SYNTH_FAILED;
+    }
+    out->samples = pcm;
+    out->n_samples = n;
+    out->sample_rate = (int)ctx->hp.sample_rate;
+    out->channels = 1;
+    return KOKORO_STATUS_OK;
 }

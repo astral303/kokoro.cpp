@@ -148,30 +148,29 @@ int main(int argc, char **argv) {
     }
 
     // Synthesize
-    int n_samples = 0;
-    float *pcm;
+    struct kokoro_audio audio = {};
+    enum kokoro_status status;
     if (use_phonemes) {
-        pcm = kokoro_synthesize_phonemes(ctx, text, &n_samples);
+        status = kokoro_synthesize_phonemes_audio(ctx, text, &audio);
     } else {
-        pcm = kokoro_synthesize(ctx, text, &n_samples);
+        status = kokoro_synthesize_audio(ctx, text, &audio);
     }
 
-    if (!pcm || n_samples <= 0) {
-        fprintf(stderr, "Synthesis failed\n");
+    if (status != KOKORO_STATUS_OK) {
+        fprintf(stderr, "Synthesis failed: %s\n", kokoro_last_error());
         kokoro_free(ctx);
         return 1;
     }
 
-    const int sr = kokoro_sample_rate(ctx);
-    if (sr <= 0 || !write_wav(output_path, pcm, n_samples, sr)) {
-        kokoro_pcm_free(pcm);
+    if (!write_wav(output_path, audio.samples, audio.n_samples, audio.sample_rate)) {
+        kokoro_audio_free(&audio);
         kokoro_free(ctx);
         return 1;
     }
-    fprintf(stderr, "Wrote %d samples (%.2f s) to %s\n", n_samples,
-            (float)n_samples / sr, output_path);
+    fprintf(stderr, "Wrote %d samples (%.2f s) to %s\n", audio.n_samples,
+            (float)audio.n_samples / audio.sample_rate, output_path);
 
-    kokoro_pcm_free(pcm);
+    kokoro_audio_free(&audio);
     kokoro_free(ctx);
     return 0;
 }
