@@ -106,7 +106,9 @@ int main(int argc, char **argv) {
     enum kokoro_backend backend = KOKORO_BACKEND_AUTO;
 
     const char *bench = getenv("KOKORO_BENCH");
-    if (bench && bench[0] != '\0' && bench[0] != '0') {
+    const char *debug_durations = getenv("KOKORO_DEBUG_DURATIONS");
+    if ((bench && bench[0] != '\0' && bench[0] != '0') ||
+        (debug_durations && debug_durations[0] != '\0' && debug_durations[0] != '0')) {
         kokoro_log_set(cli_log, nullptr);
     }
 

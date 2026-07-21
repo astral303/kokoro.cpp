@@ -267,6 +267,7 @@ for the tested revision.
 | `KOKORO_FASTCONV=0` | Disable FASTCONV kernel optimisation |
 | `KOKORO_HAR_OVERLAP=0` | Disable Vulkan harmonic/GPU overlap for A/B testing |
 | `KOKORO_LSTM_BATCH=0` | Disable Vulkan bidirectional-LSTM batching for A/B testing |
+| `KOKORO_DEBUG_DURATIONS=1` | Log raw and rounded token durations via the Kokoro callback |
 | `KOKORO_GGUF_MMAP=0` | Disable mmap for model loading |
 | `KOKORO_MLOCK=1` | Lock model pages in memory |
 

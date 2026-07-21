@@ -2327,11 +2327,19 @@ static float* kokoro_synthesize_pipeline(kokoro_context* c, const int32_t* raw_i
 
     stage_start = kokoro_bench_clock::now();
     const float length_scale = c->params.length_scale > 0.0f ? c->params.length_scale : 1.0f;
+    const bool debug_durations = kokoro_env::truthy("KOKORO_DEBUG_DURATIONS");
     std::vector<int> dur_int((size_t)L);
     for (int i = 0; i < L; i++) {
-        float v = std::nearbyintf(dur_raw[i] * length_scale);
-        if (v < 1.0f) v = 1.0f;
-        dur_int[i] = (int)v;
+        const float scaled = dur_raw[i] * length_scale;
+        float rounded = std::nearbyintf(scaled);
+        if (rounded < 1.0f)
+            rounded = 1.0f;
+        dur_int[i] = (int)rounded;
+        if (debug_durations) {
+            kokoro_log(KOKORO_LOG_DEBUG,
+                       "kokoro: duration[%d] raw=%.9g scaled=%.9g rounded=%d",
+                       i, (double)dur_raw[i], (double)scaled, dur_int[i]);
+        }
     }
 
     // --- Stage 2: host duration rounding → compact I32 alignment indices ---

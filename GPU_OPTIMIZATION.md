@@ -594,6 +594,113 @@ fixture:
 | `TANH` | 1312 | 656 | −656 |
 | `CONCAT` | 674 | 382 | −292 |
 
+## Cumulative result and optimisation policy
+
+Optimisation priority follows Amdahl's law: improve the largest measured region
+or remove a boundary that blocks overlap with it. Reducing a stage that is 10%
+of total runtime to zero can save at most 10%; reducing its kernel count without
+moving end-to-end latency is not sufficient reason to keep a complex rewrite.
+
+Representative F16 pipeline medians on the RX 7900 XTX evolved as follows:
+
+| State | Pipeline median | Change from initial |
+|---|---:|---:|
+| Corrected functional LSTM baseline | 107.91 ms | — |
+| BERT + predictor graph merge | 103.77 ms | −3.8% |
+| Time-first Vulkan generator + fused Snake | 94.00 ms | −12.9% |
+| Overlap CPU harmonic work with GPU text/decoder | 77.00 ms | −28.6% |
+| Batch bidirectional LSTM directions | 64.58 ms | **−40.2%** |
+
+These rows come from separate interleaved experiments rather than one synthetic
+sum of kernel times. The final number is steady-state synthesis-pipeline time;
+CLI model loading and WAV writing are excluded.
+
+At this point the largest remaining regions are approximately:
+
+- BERT + duration predictor: 20 ms;
+- generator: 21 ms;
+- F0/noise: 10–11 ms;
+- decoder: 7–8 ms;
+- text encoder: 3–4 ms.
+
+The generator's large convolutions already reach high throughput in Vulkan
+`mul_mat` kernels. The recurrent regions remain launch-heavy even after
+direction batching: their timestep dependency prevents batching across time,
+and there is no native GGML LSTM operation.
+
+## Explored approaches that were not retained
+
+Rejected experiments are important results. Revisit them only when a backend,
+kernel, graph allocator, or workload assumption has changed.
+
+| Experiment | Measured result | Decision / learning |
+|---|---:|---|
+| AdaIN affine as `(1+γ)·x+β` | Pipeline −0.33 ms | Removed many full-tensor ADDs in profiling but did not move wall time enough to justify changed FP ordering. |
+| Merge TextEncoder → Decoder → Generator | Pipeline +0.41 ms | Transfers were small; scheduling/allocation of the larger graph offset two removed submissions. |
+| Batch contiguous LSTM input/forget sigmoid | Pipeline −0.22 ms | Dispatch count fell, but each doubled-width sigmoid took longer. |
+| Time-first F0/noise + decoder residual stacks | Pipeline −0.27 ms | CONT count fell from 184 to 79, but those copies represented only about 0.8 ms GPU time. |
+| Batch F0 and noise branches | Pipeline median −1.35 ms; paired median −0.82 ms | Correct and potentially useful on a higher-launch-cost backend, but too much code for the measured Vulkan gain. Native `conv_1d` could not bind per-batch weights, requiring im2col + batched matmul. |
+| Batch generator K3/K7/K11 residual branches | Pipeline **+1.15 ms** | Slower. Padding all kernels to K11 increased relevant convolution FLOPs by about 57%; the generator is compute-bound enough that fewer launches did not compensate. |
+| Replace copy boundaries by one very large post-duration graph | Flat/slightly slower | Device transfers are no longer the dominant cost at these compact boundaries. |
+
+Other low-ceiling ideas remain possible but are not current priorities:
+
+- persistently prepacking batched LSTM weights removes only a small subset of
+  the remaining concat work;
+- precomputing Snake reciprocals removes less than 1 ms of measured setup;
+- moving the ~1 ms iSTFT to a graph is possible with fixed DFT matrices and
+  overlap-add, but is complex relative to its Amdahl ceiling;
+- moving harmonic generation to the GPU does not improve the current fixture
+  while its CPU work is fully hidden.
+
+Meaningful next steps probably require one of:
+
+1. a native/fused recurrent operation that performs an LSTM timestep (or
+   sequence scan) without thousands of elementwise launches;
+2. safe concurrent GPU queues for independent F0/noise and text-encoder work;
+3. multi-utterance batching for throughput rather than single-utterance
+   latency;
+4. a portable device-side harmonic/iSTFT region when CPU overlap is
+   insufficient for longer workloads.
+
+## Long-text duration parity finding
+
+The extended corpus exposed a correctness boundary that the short baseline did
+not:
+
+| Model | CPU samples | Vulkan samples | Difference |
+|---|---:|---:|---:|
+| F16 long fixture | 313,800 | 313,200 | −1 duration frame |
+| Q8_0 long fixture | 312,000 | 313,200 | +2 duration frames |
+
+`KOKORO_DEBUG_DURATIONS=1` logs every raw/scaled/rounded token duration through
+the Kokoro callback. This localized the first discrete disagreement to
+`durations_pre` values on opposite sides of half-frame rounding boundaries.
+Examples:
+
+| Model/token | CPU | Vulkan | Rounded CPU/GPU |
+|---|---:|---:|---:|
+| F16 / 55 | 3.497143 | 3.505643 | 3 / 4 |
+| F16 / 80 | 19.502647 | 19.499670 | 20 / 19 |
+| F16 / 195 | 2.503793 | 2.499181 | 3 / 2 |
+| Q8_0 / 73 | 1.498011 | 1.507703 | 1 / 2 |
+| Q8_0 / 195 | 2.479589 | 2.515164 | 2 / 3 |
+
+The batched-LSTM optimisation is not the cause: disabling
+`KOKORO_LSTM_BATCH` produced the same long-fixture sample mismatch.
+
+An attempted 1/16-frame quantisation before integer rounding was rejected. It
+made the originally observed boundary values agree, but introduced new
+quantisation boundaries: two F16 values that previously both rounded to one
+frame became one versus two, increasing the sample-count mismatch. Arbitrary
+rounding grids or fixture-specific epsilon shifts are not a correctness fix.
+
+The full-corpus harness therefore continues to fail the strict equal-sample
+gate for this fixture. Do not hide this by weakening the gate. Proper follow-up
+is stage-level comparison through BERT, duration encoder, predictor LSTM, and
+duration projection, followed by either improved backend numerical parity or a
+deliberate model-level duration policy with corpus-wide evidence.
+
 ### Phase B — stable intermediate-stage diagnostics
 
 Add a test-only observer or diagnostic executable that captures existing host
