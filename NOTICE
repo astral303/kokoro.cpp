@@ -20,7 +20,7 @@ CrispASR commit ef33e2e2ffb567528f082b142a7db69abee94ce0.
 ggml (submodule)
 ----------------
 
-  Source: https://github.com/CrispStrobe/ggml (fork of ggml-org/ggml)
+  Source: https://github.com/ggml-org/ggml
   License: MIT
 
   The ggml tensor library provides the compute backend for all neural

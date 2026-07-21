@@ -224,11 +224,11 @@ instead of calling `add_subdirectory()` again. Its source directory is normally
 inferred from the target. Set `KOKORO_GGML_DIR` explicitly if it cannot be
 inferred.
 
-The external checkout must be source-compatible with the bundled CrispStrobe
-ggml revision. kokoro.cpp uses Kokoro-specific graph operations and a private
-backend header, so an arbitrary upstream ggml release is not guaranteed to
-work. The bundled submodule remains the compatibility baseline and source of
-truth for the tested revision.
+The bundled dependency is the official upstream ggml project. An external
+checkout must expose the operations and private backend header used by
+kokoro.cpp, so arbitrary older or newer releases are not guaranteed to work.
+The bundled submodule remains the compatibility baseline and source of truth
+for the tested revision.
 
 ### Environment Variables
 
