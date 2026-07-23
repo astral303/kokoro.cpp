@@ -41,6 +41,7 @@
 #include "core/log.h"
 #include "core/matmul.h"
 #include "core/m_source_host.h"
+#include "core/simd_math.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -1976,20 +1977,27 @@ static float* kokoro_make_har(const float* f0_curve, int T_frames, int* out_T_ha
         for (int k = 0; k < dim; k++) {
             float v0 = phase_low[(size_t)i0 * dim + k] * (float)upsample_scale;
             float v1 = phase_low[(size_t)i1 * dim + k] * (float)upsample_scale;
-            float ph = v0 * (1.0f - frac) + v1 * frac;
-            sines[(size_t)t * dim + k] = std::sin(ph) * sine_amp;
+            sines[(size_t)t * dim + k] = v0 * (1.0f - frac) + v1 * frac;
         }
     }
+    core_simd::sin_scaled_inplace(sines.data(), sines.size(), sine_amp);
     tick_phase(3);
 
     // uv mask + noise + apply.
-    std::normal_distribution<float> norm(0.0f, 1.0f);
     std::vector<float> sine_waves((size_t)L_high * dim);
+    if (!kokoro_env::truthy("KOKORO_LEGACY_RNG")) {
+        core_simd::fill_standard_normal(
+            sine_waves.data(), sine_waves.size(), rng());
+    } else {
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        for (float& value : sine_waves)
+            value = normal(rng);
+    }
     for (int t = 0; t < L_high; t++) {
         const float uv = (f0_up[t] > voiced_threshold) ? 1.0f : 0.0f;
         const float noise_a = uv * noise_std + (1.0f - uv) * sine_amp / 3.0f;
         for (int k = 0; k < dim; k++) {
-            float n = noise_a * norm(rng);
+            float n = noise_a * sine_waves[(size_t)t * dim + k];
             sine_waves[(size_t)t * dim + k] = sines[(size_t)t * dim + k] * uv + n;
         }
     }
@@ -2022,14 +2030,14 @@ static float* kokoro_make_har(const float* f0_curve, int T_frames, int* out_T_ha
 
     const int T_har = L_high / hop + 1;
     // Direct DFT (n_fft=20 makes 20² = 400 ops/frame trivial).
-    // Pre-compute twiddles cos/sin for k in 0..n_bins-1, n in 0..n_fft-1.
+    // Pre-compute transposed twiddles so frequency bins are contiguous for SIMD.
     std::vector<float> tw_cos((size_t)n_bins * n_fft);
     std::vector<float> tw_sin((size_t)n_bins * n_fft);
-    for (int k = 0; k < n_bins; k++) {
-        for (int n = 0; n < n_fft; n++) {
+    for (int n = 0; n < n_fft; n++) {
+        for (int k = 0; k < n_bins; k++) {
             float ang = -kKokoroTwoPi * (float)k * (float)n / (float)n_fft;
-            tw_cos[(size_t)k * n_fft + n] = std::cos(ang);
-            tw_sin[(size_t)k * n_fft + n] = std::sin(ang);
+            tw_cos[(size_t)n * n_bins + k] = std::cos(ang);
+            tw_sin[(size_t)n * n_bins + k] = std::sin(ang);
         }
     }
 
@@ -2038,24 +2046,9 @@ static float* kokoro_make_har(const float* f0_curve, int T_frames, int* out_T_ha
     float* har = (float*)std::malloc((size_t)22 * T_har * sizeof(float));
     if (!har)
         return nullptr;
-    for (int frame = 0; frame < T_har; frame++) {
-        const int t0 = frame * hop;
-        for (int k = 0; k < n_bins; k++) {
-            float re = 0.0f, im = 0.0f;
-            const float* tc = &tw_cos[(size_t)k * n_fft];
-            const float* ts = &tw_sin[(size_t)k * n_fft];
-            for (int n = 0; n < n_fft; n++) {
-                const float xn = padded[t0 + n] * hann[n];
-                re += xn * tc[n];
-                im += xn * ts[n];
-            }
-            const float mag = std::sqrt(re * re + im * im);
-            const float ph = std::atan2(im, re);
-            // (22, T_har) channel-major: element (c, t) at offset c + t*22.
-            har[(size_t)frame * 22 + k] = mag;
-            har[(size_t)frame * 22 + n_bins + k] = ph;
-        }
-    }
+    core_simd::stft20(
+        padded.data(), static_cast<size_t>(T_har), hop, hann.data(),
+        tw_cos.data(), tw_sin.data(), har);
     tick_phase(5);
     if (out_T_har)
         *out_T_har = T_har;

@@ -6,7 +6,7 @@ Standalone C/C++ inference for [Kokoro-82M](https://huggingface.co/hexgrad/Kokor
 - **CPU and GPU** — CPU fallback plus Vulkan, Metal, and CUDA backends
 - **C ABI** — suitable for cgo, FFI, Python ctypes, Rust bindgen
 - **24 kHz mono** — non-autoregressive, full-utterance synthesis
-- **Minimal CPU dependencies** — pinned ggml submodule + espeak-ng (system)
+- **Portable SIMD** — pinned Highway and ggml submodules + espeak-ng (system)
 
 ## Quick Start
 
@@ -275,6 +275,8 @@ ctest  # run model-free tests
 | `KOKORO_METAL` | ON on Apple | Build the Metal backend |
 | `KOKORO_CUDA` | OFF | Build the CUDA backend |
 | `KOKORO_GGML_DIR` | bundled `ggml/` | Use a compatible external ggml source checkout |
+| `KOKORO_USE_SYSTEM_HIGHWAY` | OFF | Use an installed Highway CMake package |
+| `KOKORO_HIGHWAY_TARGET` | empty | Existing parent-provided Highway target |
 
 At runtime, `KOKORO_BACKEND_AUTO` tries Metal, CUDA, Vulkan, then CPU among the
 compiled backends. An explicitly requested unavailable backend is an error.
@@ -313,6 +315,11 @@ kokoro.cpp, so arbitrary older or newer releases are not guaranteed to work.
 The bundled submodule remains the compatibility baseline and source of truth
 for the tested revision.
 
+The harmonic-source CPU frontend uses Highway for runtime-dispatched SIMD math
+on x86 and ARM. A parent-provided `hwy::hwy` target is reused automatically.
+Set `KOKORO_HIGHWAY_TARGET` for a differently named target, or
+`KOKORO_USE_SYSTEM_HIGHWAY=ON` to require an installed package.
+
 ### Environment Variables
 
 | Variable | Description |
@@ -320,13 +327,20 @@ for the tested revision.
 | `KOKORO_ESPEAK_DATA_PATH` | Override espeak-ng data directory |
 | `KOKORO_BENCH=1` | Print per-stage timing to log. Also emits GPU lifecycle subphases (`stage.graph_build` / `.reset_alloc` / `.upload` / `.compute` / `.download` / `.host`) and CPU harmonic subphases (`har_phase.*`). Harmonic phase times are collected on the worker and logged only after join on the caller thread. |
 | `KOKORO_BENCH_ITERS=N` | CLI only: repeat synthesis N times in-process (requires `KOKORO_BENCH=1`; last WAV is written) |
-| `KOKORO_SEED=N` | Fix RNG seed for reproducible output |
+| `KOKORO_SEED=N` | Fix RNG seed for reproducible output in the same runtime environment |
+| `KOKORO_LEGACY_RNG=1` | Use the slower historical `std::normal_distribution` harmonic-noise stream for output comparison |
 | `KOKORO_FASTCONV=0` | Disable FASTCONV kernel optimisation |
 | `KOKORO_HAR_OVERLAP=0` | Disable Vulkan harmonic/GPU overlap for A/B testing |
 | `KOKORO_LSTM_BATCH=0` | Disable Vulkan bidirectional-LSTM batching for A/B testing |
 | `KOKORO_DEBUG_DURATIONS=1` | Log raw and rounded token durations via the Kokoro callback |
 | `KOKORO_GGUF_MMAP=0` | Disable mmap for model loading |
 | `KOKORO_MLOCK=1` | Lock model pages in memory |
+
+Fixed-seed output is repeatable when the build, backend, and CPU SIMD target are
+unchanged. Highway's vector random stream is lane-width dependent, so the same
+seed may produce different PCM on different CPU architectures or ISA targets
+(for example AVX2 versus AVX-512 or NEON). `KOKORO_SEED` is therefore not a
+cross-platform bit-reproducibility guarantee.
 
 GGML backend environment variables are not Kokoro options. In particular,
 `GGML_VK_ALLOW_GRAPHICS_QUEUE` is a runtime, presence-based GGML Vulkan control

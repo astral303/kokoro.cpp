@@ -49,8 +49,11 @@ option(KOKORO_WERROR       "Treat warnings in kokoro.cpp sources as errors" OFF)
 option(KOKORO_VULKAN       "Enable Vulkan GPU backend" ${_KOKORO_DEFAULT_VULKAN})
 option(KOKORO_METAL        "Enable Metal GPU backend" ${_KOKORO_DEFAULT_METAL})
 option(KOKORO_CUDA         "Enable CUDA GPU backend" OFF)
+option(KOKORO_USE_SYSTEM_HIGHWAY "Use an installed Highway CMake package" OFF)
 set(KOKORO_GGML_DIR "" CACHE PATH
     "External ggml source checkout (default: bundled submodule)")
+set(KOKORO_HIGHWAY_TARGET "" CACHE STRING
+    "Existing parent-provided Highway target (for example hwy::hwy)")
 
 # ===========================================================================
 # ggml (CPU-only)
@@ -173,6 +176,29 @@ endif()
 
 message(STATUS "espeak-ng found: ${ESPEAK_NG_FOUND}")
 
+# Portable SIMD math used by CPU synthesis helpers.
+if(KOKORO_HIGHWAY_TARGET)
+    if(NOT TARGET ${KOKORO_HIGHWAY_TARGET})
+        message(FATAL_ERROR
+            "KOKORO_HIGHWAY_TARGET=${KOKORO_HIGHWAY_TARGET} is not a CMake target")
+    endif()
+    set(_kokoro_highway_target ${KOKORO_HIGHWAY_TARGET})
+elseif(TARGET hwy::hwy)
+    set(_kokoro_highway_target hwy::hwy)
+elseif(KOKORO_USE_SYSTEM_HIGHWAY)
+    find_package(hwy CONFIG REQUIRED)
+    set(_kokoro_highway_target hwy::hwy)
+else()
+    set(HWY_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_CONTRIB ON CACHE BOOL "" FORCE)
+    set(HWY_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(HWY_FORCE_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    add_subdirectory(highway EXCLUDE_FROM_ALL)
+    set(_kokoro_highway_target hwy)
+endif()
+
 # ===========================================================================
 # kokoro library
 # ===========================================================================
@@ -180,6 +206,7 @@ message(STATUS "espeak-ng found: ${ESPEAK_NG_FOUND}")
 set(KOKORO_SOURCES
     src/kokoro.cpp
     src/core/gguf_loader.cpp
+    src/core/simd_math.cpp
 )
 
 if(KOKORO_STATIC)
@@ -214,10 +241,13 @@ target_link_libraries(kokoro PUBLIC
     PkgConfig::ESPEAK_NG
     Threads::Threads
 )
+target_link_libraries(kokoro PRIVATE ${_kokoro_highway_target})
 
 # Strict warnings for project-owned code (not propagated to ggml)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(kokoro PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+    set_source_files_properties(src/core/simd_math.cpp PROPERTIES
+        COMPILE_OPTIONS "-Wno-pedantic")
     if(KOKORO_WERROR)
         target_compile_options(kokoro PRIVATE -Werror)
     endif()
@@ -304,6 +334,19 @@ if(KOKORO_BUILD_TESTS)
         endif()
     endif()
     add_test(NAME har-async COMMAND test-har-async)
+
+    add_executable(test-simd-math tests/test-simd-math.cpp)
+    target_include_directories(test-simd-math PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(test-simd-math PRIVATE kokoro)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test-simd-math PRIVATE -Wall -Wextra -Wpedantic)
+        if(KOKORO_WERROR)
+            target_compile_options(test-simd-math PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME simd-math COMMAND test-simd-math)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

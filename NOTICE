@@ -26,6 +26,17 @@ ggml (submodule)
   The ggml tensor library provides the compute backend for all neural
   network operations (conv, matmul, LSTM gates, attention).
 
+Google Highway (submodule)
+--------------------------
+
+  Source: https://github.com/google/highway
+  License: Apache-2.0 or BSD-3-Clause, at the user's choice
+
+  Highway provides runtime-dispatched portable SIMD math for harmonic-source
+  sine generation, Gaussian noise, and the 20-point STFT. Its vector random
+  helper is separately dedicated to the public domain under CC0-1.0. Full
+  license texts are retained in `highway/LICENSE`.
+
 espeak-ng (linked dependency)
 -----------------------------
 

@@ -1319,6 +1319,52 @@ rewrites:
 - safe concurrent GPU queues for independent F0/noise and text-encoder work;
 - multi-utterance batching for throughput rather than single-utterance latency.
 
+### Retained: Highway SIMD harmonic source
+
+Fresh profiling after the earlier Vulkan work showed that the host harmonic
+source remained on the critical path for longer utterances:
+
+| F16 fixture | Pipeline | Harmonic worker | Unhidden harmonic wait |
+|---|---:|---:|---:|
+| baseline text | `39.74 ms` | `9.45 ms` | `2.56 ms` |
+| long fixture | `172.68 ms` | `46.73 ms` | `33.69 ms` |
+
+The scalar hotspots were phase interpolation plus `sinf`, Gaussian noise from
+`std::normal_distribution`, and the direct 20-point STFT (`sqrtf`/`atan2f`).
+The retained implementation uses the permissively licensed Google Highway
+library with runtime ISA dispatch:
+
+- vector sine for the upsampled harmonic phase;
+- vector Xoshiro + Box-Muller Gaussian noise;
+- an 11-bin SIMD DFT with vector magnitude and phase.
+
+Eight interleaved process pairs used `KOKORO_BENCH_ITERS=4`; iteration zero was
+discarded and each process contributed the median of its three warm runs.
+Every optimized pair was faster:
+
+| F16 fixture/stage | Baseline | Highway | Paired median delta |
+|---|---:|---:|---:|
+| baseline harmonic source | `9.45 ms` | `2.33 ms` | `-7.07 ms` |
+| baseline harmonic wait | `2.56 ms` | `0.00 ms` | `-2.56 ms` |
+| baseline pipeline | `39.74 ms` | `37.12 ms` | **`-2.41 ms`** |
+| long harmonic source | `46.73 ms` | `14.38 ms` | `-32.39 ms` |
+| long harmonic wait | `33.69 ms` | `1.31 ms` | `-32.47 ms` |
+| long pipeline | `172.68 ms` | `132.68 ms` | **`-40.95 ms`** |
+
+The short harmonic worker is `4.06x` faster and becomes fully hidden by text
+encoder + decoder work. The long worker is `3.25x` faster and nearly hidden.
+The long generator also improved by a paired `8.21 ms` under the shorter CPU
+wait; as with the earlier overlap result, this is an observed scheduling/device
+clock effect rather than changed generator graph math.
+
+The fast Gaussian stream deliberately changes fixed-seed PCM. Against the
+historical seed-1234 output, long-fixture correlation is `0.99313` and relative
+RMS delta is `0.11714`. This matches ordinary historical seed variation
+(`0.99327`, `0.11599` for seed 1235), and repeated fast seed-1234 runs are
+bit-identical. `KOKORO_LEGACY_RNG=1` retains the historical
+`std::normal_distribution` stream for comparisons; with legacy noise, the SIMD
+sine/STFT-only output has correlation `0.99993`.
+
 ## Definition of “GPU support works properly”
 
 A backend is considered supported when:
