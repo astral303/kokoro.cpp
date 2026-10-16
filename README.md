@@ -277,6 +277,7 @@ ctest  # run model-free tests
 | `KOKORO_GGML_DIR` | bundled `ggml/` | Use a compatible external ggml source checkout |
 | `KOKORO_USE_SYSTEM_HIGHWAY` | OFF | Use an installed Highway CMake package |
 | `KOKORO_HIGHWAY_TARGET` | empty | Existing parent-provided Highway target |
+| `KOKORO_ESPEAK` | ON | Link espeak-ng for text input. OFF builds accept IPA phoneme input only (`kokoro_synthesize_phonemes`, `kokoro_synthesize_phonemes_audio`, CLI `--phonemes`) |
 
 At runtime, `KOKORO_BACKEND_AUTO` tries Metal, CUDA, Vulkan, then CPU among the
 compiled backends. An explicitly requested unavailable backend is an error.
@@ -356,12 +357,10 @@ for compatibility, timing, and benchmark details.
 
 The kokoro.cpp source code is MIT-licensed (see [LICENSE](LICENSE)).
 
-**Important**: This project requires [espeak-ng](https://github.com/espeak-ng/espeak-ng) as a directly-linked dependency. espeak-ng is licensed under GPLv3+. When you build and distribute the combined binary, the result is subject to GPLv3+ terms. See [NOTICE](NOTICE) for full details.
+**Important**: By default, this project links [espeak-ng](https://github.com/espeak-ng/espeak-ng) directly for text input. espeak-ng is licensed under GPLv3+. When you build and distribute the combined binary, the result is subject to GPLv3+ terms. See [NOTICE](NOTICE) for full details.
 
-The current build intentionally treats espeak-ng as a hard dependency, even
-when callers provide precomputed phonemes. A non-GPL build would require a
-source-level build option that removes this link; no such mode is supported
-today.
+A build configured with `-DKOKORO_ESPEAK=OFF` does not link espeak-ng and
+accepts IPA phoneme input only.
 
 ## Provenance
 

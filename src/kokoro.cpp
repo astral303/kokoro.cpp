@@ -79,7 +79,9 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef KOKORO_HAS_ESPEAK
 #include <espeak-ng/speak_lib.h>
+#endif
 
 // ===========================================================================
 // Logging infrastructure
@@ -3151,6 +3153,7 @@ extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const c
     return audio;
 }
 
+#ifdef KOKORO_HAS_ESPEAK
 namespace {
 
 // Strip ASCII whitespace from both ends.
@@ -3257,6 +3260,7 @@ bool phonemize_cached(kokoro_context* ctx, const std::string& lang, const std::s
 }
 
 } // namespace
+#endif
 
 
 
@@ -3273,7 +3277,11 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
         kokoro_set_error("no voice pack loaded");
         return nullptr;
     }
-
+#ifndef KOKORO_HAS_ESPEAK
+    kokoro_set_error("text input is disabled (built with KOKORO_ESPEAK=OFF); "
+                     "pass IPA phonemes instead");
+    return nullptr;
+#else
     // Process-wide, one-shot quality warnings.
     static std::atomic<bool> warned_cmn{false};
     static std::atomic<bool> warned_ja_kanji{false};
@@ -3320,6 +3328,7 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
     if (ctx->params.verbosity >= 1)
         kokoro_log(KOKORO_LOG_INFO, "kokoro: phonemes: '%s'", phonemes.c_str());
     return kokoro_synthesize_phonemes(ctx, phonemes.c_str(), out_n_samples);
+#endif
 }
 
 

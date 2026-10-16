@@ -50,6 +50,7 @@ option(KOKORO_VULKAN       "Enable Vulkan GPU backend" ${_KOKORO_DEFAULT_VULKAN}
 option(KOKORO_METAL        "Enable Metal GPU backend" ${_KOKORO_DEFAULT_METAL})
 option(KOKORO_CUDA         "Enable CUDA GPU backend" OFF)
 option(KOKORO_USE_SYSTEM_HIGHWAY "Use an installed Highway CMake package" OFF)
+option(KOKORO_ESPEAK       "Link espeak-ng for text input" ON)
 set(KOKORO_GGML_DIR "" CACHE PATH
     "External ggml source checkout (default: bundled submodule)")
 set(KOKORO_HIGHWAY_TARGET "" CACHE STRING
@@ -134,47 +135,52 @@ if(NOT KOKORO_GGML_DIR OR
 endif()
 
 # ===========================================================================
-# espeak-ng (required, directly linked)
+# espeak-ng (directly linked unless KOKORO_ESPEAK=OFF)
 # ===========================================================================
 
-# Try pkg-config first (works with Nix, system packages)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(ESPEAK_NG IMPORTED_TARGET espeak-ng)
-endif()
-
-if(NOT ESPEAK_NG_FOUND)
-    # Fallback: find the library and header manually
-    find_path(ESPEAK_NG_INCLUDEDIR espeak-ng/speak_lib.h
-        PATHS /usr/include /usr/local/include /opt/homebrew/include
-        PATH_SUFFIXES include)
-    find_library(ESPEAK_NG_LIB NAMES espeak-ng espeak
-        PATHS /usr/lib /usr/local/lib /opt/homebrew/lib
-              /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
-        PATH_SUFFIXES lib)
-
-    if(ESPEAK_NG_INCLUDEDIR AND ESPEAK_NG_LIB)
-        # Create an imported target so downstream usage is uniform
-        add_library(PkgConfig::ESPEAK_NG UNKNOWN IMPORTED)
-        set_target_properties(PkgConfig::ESPEAK_NG PROPERTIES
-            IMPORTED_LOCATION "${ESPEAK_NG_LIB}"
-            INTERFACE_INCLUDE_DIRECTORIES "${ESPEAK_NG_INCLUDEDIR}")
-        set(ESPEAK_NG_FOUND TRUE)
+if(KOKORO_ESPEAK)
+    # Try pkg-config first (works with Nix, system packages)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ESPEAK_NG IMPORTED_TARGET espeak-ng)
     endif()
-endif()
 
-if(NOT ESPEAK_NG_FOUND)
-    message(FATAL_ERROR
-        "espeak-ng is REQUIRED but was not found.\n"
-        "Install it via your package manager:\n"
-        "  Debian/Ubuntu: sudo apt install libespeak-ng-dev\n"
-        "  Fedora:        sudo dnf install espeak-ng-devel\n"
-        "  macOS:         brew install espeak-ng\n"
-        "  Nix:           available via parent flake\n"
-        "Or set ESPEAK_NG_INCLUDEDIR and ESPEAK_NG_LIB manually.")
-endif()
+    if(NOT ESPEAK_NG_FOUND)
+        # Fallback: find the library and header manually
+        find_path(ESPEAK_NG_INCLUDEDIR espeak-ng/speak_lib.h
+            PATHS /usr/include /usr/local/include /opt/homebrew/include
+            PATH_SUFFIXES include)
+        find_library(ESPEAK_NG_LIB NAMES espeak-ng espeak
+            PATHS /usr/lib /usr/local/lib /opt/homebrew/lib
+                  /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
+            PATH_SUFFIXES lib)
 
-message(STATUS "espeak-ng found: ${ESPEAK_NG_FOUND}")
+        if(ESPEAK_NG_INCLUDEDIR AND ESPEAK_NG_LIB)
+            # Create an imported target so downstream usage is uniform
+            add_library(PkgConfig::ESPEAK_NG UNKNOWN IMPORTED)
+            set_target_properties(PkgConfig::ESPEAK_NG PROPERTIES
+                IMPORTED_LOCATION "${ESPEAK_NG_LIB}"
+                INTERFACE_INCLUDE_DIRECTORIES "${ESPEAK_NG_INCLUDEDIR}")
+            set(ESPEAK_NG_FOUND TRUE)
+        endif()
+    endif()
+
+    if(NOT ESPEAK_NG_FOUND)
+        message(FATAL_ERROR
+            "espeak-ng is REQUIRED but was not found.\n"
+            "Install it via your package manager:\n"
+            "  Debian/Ubuntu: sudo apt install libespeak-ng-dev\n"
+            "  Fedora:        sudo dnf install espeak-ng-devel\n"
+            "  macOS:         brew install espeak-ng\n"
+            "  Nix:           available via parent flake\n"
+            "Or set ESPEAK_NG_INCLUDEDIR and ESPEAK_NG_LIB manually.\n"
+            "For IPA phoneme input only, configure with -DKOKORO_ESPEAK=OFF.")
+    endif()
+
+    message(STATUS "espeak-ng found: ${ESPEAK_NG_FOUND}")
+else()
+    message(STATUS "kokoro.cpp espeak-ng: disabled (IPA phoneme input only)")
+endif()
 
 # Portable SIMD math used by CPU synthesis helpers.
 if(KOKORO_HIGHWAY_TARGET)
@@ -238,9 +244,11 @@ target_include_directories(kokoro PRIVATE
 find_package(Threads REQUIRED)
 target_link_libraries(kokoro PUBLIC
     ggml
-    PkgConfig::ESPEAK_NG
     Threads::Threads
 )
+if(KOKORO_ESPEAK)
+    target_link_libraries(kokoro PUBLIC PkgConfig::ESPEAK_NG)
+endif()
 target_link_libraries(kokoro PRIVATE ${_kokoro_highway_target})
 
 # Strict warnings for project-owned code (not propagated to ggml)
@@ -266,6 +274,9 @@ if(KOKORO_HAS_METAL)
 endif()
 if(KOKORO_HAS_CUDA)
     target_compile_definitions(kokoro PRIVATE KOKORO_HAS_CUDA)
+endif()
+if(KOKORO_ESPEAK)
+    target_compile_definitions(kokoro PRIVATE KOKORO_HAS_ESPEAK)
 endif()
 
 # Propagate KOKORO_STATIC to consumers of the static lib

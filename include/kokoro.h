@@ -169,8 +169,9 @@ KOKORO_API int kokoro_voice_max_phonemes(const struct kokoro_context * ctx);
 KOKORO_API int32_t * kokoro_phonemes_to_ids(struct kokoro_context * ctx,
                                             const char * phonemes, int * out_n);
 
-// Text → 24 kHz mono float32 PCM (runs espeak-ng phonemizer).
-// Caller frees with kokoro_pcm_free.
+// Text → 24 kHz mono float32 PCM. Caller frees with kokoro_pcm_free.
+// A KOKORO_ESPEAK=ON build runs the espeak-ng phonemizer. A KOKORO_ESPEAK=OFF
+// build returns NULL and sets kokoro_last_error().
 KOKORO_API float * kokoro_synthesize(struct kokoro_context * ctx,
                                      const char * text, int * out_n_samples);
 
@@ -199,7 +200,8 @@ struct kokoro_audio {
 KOKORO_API void kokoro_audio_free(struct kokoro_audio * audio);
 
 // Synthesise text with structured output. Fills/resets *out.
-// Returns KOKORO_STATUS_OK on success.
+// Returns KOKORO_STATUS_OK on success. A KOKORO_ESPEAK=OFF build returns
+// KOKORO_STATUS_SYNTH_FAILED for valid arguments and a loaded voice.
 KOKORO_API enum kokoro_status kokoro_synthesize_audio(struct kokoro_context * ctx,
                                                       const char * text,
                                                       struct kokoro_audio * out);

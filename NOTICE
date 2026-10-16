@@ -43,8 +43,9 @@ espeak-ng (linked dependency)
   Source: https://github.com/espeak-ng/espeak-ng
   License: GPLv3+
 
-  espeak-ng is used for text-to-phoneme conversion. It is linked
-  directly into the resulting binary (not loaded at runtime via dlopen).
+  espeak-ng is used for text-to-phoneme conversion. A default build
+  (KOKORO_ESPEAK=ON) links espeak-ng directly into the resulting binary
+  (not loaded at runtime via dlopen).
 
   IMPORTANT: Because espeak-ng is licensed under GPLv3+, any binary that
   links this library (including the kokoro static library and the
@@ -55,10 +56,9 @@ espeak-ng (linked dependency)
     2. Complete corresponding source code must be made available.
     3. Users must receive a copy of the GPL license.
 
-  A non-GPL build would need to remove this hard link and supply phonemes
-  through kokoro_synthesize_phonemes(), or replace espeak-ng with a
-  permissively licensed phonemizer. That is not a supported build mode in
-  this project today.
+  A build configured with -DKOKORO_ESPEAK=OFF does not link espeak-ng.
+  It accepts IPA phonemes through kokoro_synthesize_phonemes() and
+  kokoro_synthesize_phonemes_audio(); text input returns an error.
 
   The kokoro library code itself (src/kokoro.cpp, src/phoneme_utils.h,
   include/kokoro.h, etc.) is MIT-licensed. Only the act of linking with
